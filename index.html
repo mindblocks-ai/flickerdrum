@@ -128,6 +128,9 @@
     position: fixed; inset: 0; z-index: 30; display: none;
     background: #000; cursor: none;
   }
+  /* the panel still scrolls behind the stage, and its scrollbar would sit on top
+     of the fullscreen flicker */
+  html.session, html.session body { overflow: hidden; }
   #hud {
     position: fixed; left: 16px; bottom: 14px; z-index: 31;
     font-size: 12px; color: rgba(233,227,214,.65);
@@ -362,6 +365,7 @@ const state = {
   lastMediaWall: 0,
   toneW: 0,                // current tone gate weight (may run at the drum's rate, not the light's)
   toneCtx: null, toneGate: null, toneVolNode: null,
+  toneBeforeLive: null,    // tone setting parked while the live tab forces it off
   live: {                  // microphone beat tracker
     ctx: null, analyser: null, buf: null, stream: null, monitoring: false,
     prevE: 0, fluxHist: [], scope: [], hits: 0,
@@ -384,6 +388,7 @@ function setMode(mode) {
   $('liveControls').classList.toggle('hidden', mode !== 'live');
   $('fixedControls').classList.toggle('hidden', mode !== 'fixed');
   updateBegin();
+  syncToneForMode();
   updateToneNote();   // the tone note describes the current mode
   // canvases drawn while this tab was hidden rendered at 0×0 — redraw now
   if (mode === 'drum' && state.curve) drawCurve();
@@ -412,12 +417,33 @@ $('bright').addEventListener('input', () => { $('brightOut').textContent = $('br
 $('toneVol').addEventListener('input', () => {
   if (state.toneVolNode) state.toneVolNode.gain.value = 0.4 * (+$('toneVol').value / 100);
 });
+// A synthesized pulse can only fire once the detector has recognized a strike —
+// an analysis window, a frame of rAF, and output latency after the fact. Against a
+// recording that is invisible (tone and audio share a clock), but in live drum mode
+// you also hear the real drum in the room, and the tone trails it by a flam nobody
+// can tune out. So it is forced off there rather than offered and disappointing.
+function syncToneForMode() {
+  const live = state.mode === 'live';
+  if (live) {
+    if ($('tone').value === 'on') state.toneBeforeLive = 'on';
+    $('tone').value = 'off';
+  } else if (state.toneBeforeLive) {
+    $('tone').value = state.toneBeforeLive;
+    state.toneBeforeLive = null;
+  }
+  $('tone').disabled = live;
+  $('toneHz').disabled = live;
+  $('toneVol').disabled = live;
+}
+
 // says what will actually happen in the mode you're in — "per drum hit" is
 // meaningless in fixed rate, where there is no drum to ride
 function updateToneNote() {
   const onBeat = $('toneSync').value === 'beat';
-  $('toneSync').disabled = state.mode === 'fixed';   // both options mean the same with no drum
-  $('toneNote').textContent = $('tone').value !== 'on' ? ''
+  $('toneSync').disabled = state.mode !== 'drum';   // no drum to ride, or forced off
+  $('toneNote').textContent =
+      state.mode === 'live' ? 'off in live drum — a synthesized pulse always trails the drum you hear in the room'
+    : $('tone').value !== 'on' ? ''
     : state.mode === 'fixed' ? 'a pulse on every flash'
     : onBeat ? 'one pulse per drum hit'
     : 'a pulse on every flash — denser than the drum';
@@ -1068,6 +1094,7 @@ async function begin() {
   startTone();
 
   stage.style.display = 'block';
+  document.documentElement.classList.add('session');
   hud.classList.remove('hidden', 'faded');
   if (document.documentElement.requestFullscreen) {
     try { await document.documentElement.requestFullscreen(); } catch (e) {}
@@ -1302,6 +1329,7 @@ function dismissReturn() {
   clearTimeout(state.returnTimer);
   $('returnMsg').classList.add('hidden');
   $('stage').style.display = 'none';
+  document.documentElement.classList.remove('session');
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
 }
 
