@@ -594,8 +594,10 @@ function tracksUnlocked() {
   return ok;
 }
 
+const TRACKS_ON = tracksUnlocked();
+
 function buildPresets() {
-  if (!TRACKS.length || !tracksUnlocked()) return;
+  if (!TRACKS.length || !TRACKS_ON) return;
   const box = $('presetBtns');
   TRACKS.forEach(t => {
     const b = document.createElement('button');
@@ -607,6 +609,15 @@ function buildPresets() {
   $('presetRow').classList.remove('hidden');
 }
 buildPresets();
+
+// the private link also carries the settings we actually practice with; the public
+// page keeps the gentler, quieter defaults for someone arriving cold
+if (TRACKS_ON) {
+  $('fadeIn').value = '15';
+  $('tone').value = 'on';
+  $('toneVol').value = '44';
+  updateToneNote();
+}
 
 async function loadPreset(track, btn) {
   const gen = ++state.analysisGen;
