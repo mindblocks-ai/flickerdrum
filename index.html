@@ -1433,7 +1433,10 @@ async function startVR() {
 function xrTick(now, frame) {
   const session = state.xrSession;
   if (!state.running || !session) return;
-  if (state.mode === 'live') micStep();   // window rAF does not run us in here
+  // window rAF does not run us in here. Guarded for the same reason the flat loop
+  // is: a throw would end this loop and leave the compositor holding the last
+  // frame, which may be a full-brightness flash.
+  try { if (state.mode === 'live') micStep(); } catch (e) {}
   const f = advance(now);
   if (f.stop) { stop(!!f.natural); return; }
   const gl = state.gl;
