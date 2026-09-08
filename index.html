@@ -143,6 +143,8 @@
     padding: 8px 14px; cursor: pointer;
   }
   .btn2:disabled { color: var(--dim); cursor: default; }
+  .btn2:hover:not(:disabled) { border-color: var(--ember); }
+  .btn2.on { border-color: var(--ember); color: var(--ember); }
   .meter { flex: 1; min-width: 120px; height: 8px; background: var(--ink0); border: 1px solid var(--line); }
   .meter > div { height: 100%; background: var(--ember); width: 0%; }
 
@@ -183,6 +185,10 @@
     <legend>Drum track</legend>
     <div class="row">
       <input type="file" id="audioFile" accept="audio/*">
+    </div>
+    <div class="row hidden" id="presetRow">
+      <label class="small">Or a bundled track</label>
+      <span id="presetBtns" style="display:flex;gap:8px;flex-wrap:wrap"></span>
     </div>
     <p class="hint">Use a local audio file (mp3, wav, ogg). If your track lives on YouTube, convert it to an audio file first — or use a freely distributed drumming track from
       <a href="https://shamanicdrumming.com/free_downloads.html" target="_blank" rel="noopener">shamanicdrumming.com</a>,
@@ -522,30 +528,122 @@ async function loadAudio() {
   const file = $('audioFile').files[0];
   if (!file) return;
   const gen = ++state.analysisGen;
-  status('Decoding audio…');
+  [...$('presetBtns').children].forEach(b => b.classList.remove('on'));
   try {
-    if (state.audioURL) URL.revokeObjectURL(state.audioURL);
-    state.audioURL = URL.createObjectURL(file);
-    $('player').src = state.audioURL;   // playback streams the file; no giant buffer held
-
-    // decode a low-rate copy for analysis only — onsets don't need 44.1 kHz,
-    // and a 30-minute track decoded full-rate is ~600 MB of floats
-    const bytes = await file.arrayBuffer();
-    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-    let decoded;
-    try {
-      decoded = await new OAC(1, 1, 11025).decodeAudioData(bytes.slice(0));
-    } catch (eLow) {                       // some WebKit builds reject low-rate contexts
-      decoded = await new OAC(1, 1, 44100).decodeAudioData(bytes);
-    }
-    if (gen !== state.analysisGen) return; // a newer file was picked meanwhile
-    state.buffer = decoded;
-    await analyze(gen);
+    await ingest(await file.arrayBuffer(), file, gen);
   } catch (e) {
-    if (gen !== state.analysisGen) return;
-    status('Could not decode that file — try mp3/wav/ogg.');
-    state.buffer = null; state.curve = null; updateBegin(); clearAnalysisUI();
+    failLoad(gen, 'Could not decode that file — try mp3/wav/ogg.');
   }
+}
+
+// shared by the file picker and the bundled tracks: `blob` feeds playback,
+// `bytes` feeds analysis. The blob is made before decoding because
+// decodeAudioData detaches the buffer it is given.
+async function ingest(bytes, blob, gen) {
+  if (gen !== state.analysisGen) return;
+  if (state.audioURL) URL.revokeObjectURL(state.audioURL);
+  state.audioURL = URL.createObjectURL(blob);
+  $('player').src = state.audioURL;   // playback streams from the blob; no giant buffer held
+  status('Decoding audio…');
+
+  // decode a low-rate copy for analysis only — onsets don't need 44.1 kHz,
+  // and a 30-minute track decoded full-rate is ~600 MB of floats
+  const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  let decoded;
+  try {
+    decoded = await new OAC(1, 1, 11025).decodeAudioData(bytes.slice(0));
+  } catch (eLow) {                       // some WebKit builds reject low-rate contexts
+    decoded = await new OAC(1, 1, 44100).decodeAudioData(bytes);
+  }
+  if (gen !== state.analysisGen) return; // a newer track was picked meanwhile
+  state.buffer = decoded;
+  await analyze(gen);
+}
+
+function failLoad(gen, msg) {
+  if (gen !== state.analysisGen) return;
+  status(msg);
+  state.buffer = null; state.curve = null; updateBegin(); clearAnalysisUI();
+}
+
+/* ---------- bundled tracks (served from the site itself) ----------
+   Add audio files to the repo and list them below; the row hides itself when the
+   list is empty, and when a path 404s (previews, or a copy of this file opened
+   on its own) only that button reports the failure.
+
+   The row also stays hidden unless the visitor arrives with ?tracks=<TRACKS_KEY>,
+   which is why the private link is flickerdrum.xyz/?tracks=ombu — the key is then
+   remembered so they only need it once.
+
+   This is obscurity, NOT access control: the site is public, so the audio URLs and
+   this key are readable by anyone who views the page source. It keeps the buttons
+   off the public page; it cannot stop a determined stranger from fetching a file. */
+const TRACKS_KEY = 'ombu';
+const TRACKS = [
+  { name: 'Journey · 30 min + drone', file: 'tracks/journey-30-drone.mp3' },
+  { name: 'Journey · 30 min', file: 'tracks/journey-30.mp3' },
+];
+
+function tracksUnlocked() {
+  let ok = false;
+  try {
+    ok = new URLSearchParams(location.search).get('tracks') === TRACKS_KEY;
+    if (ok) localStorage.setItem('fd-tracks', TRACKS_KEY);
+    else ok = localStorage.getItem('fd-tracks') === TRACKS_KEY;
+  } catch (e) {}   // private windows can throw on storage access
+  return ok;
+}
+
+function buildPresets() {
+  if (!TRACKS.length || !tracksUnlocked()) return;
+  const box = $('presetBtns');
+  TRACKS.forEach(t => {
+    const b = document.createElement('button');
+    b.className = 'btn2';
+    b.textContent = t.name;
+    b.addEventListener('click', () => loadPreset(t, b));
+    box.appendChild(b);
+  });
+  $('presetRow').classList.remove('hidden');
+}
+buildPresets();
+
+async function loadPreset(track, btn) {
+  const gen = ++state.analysisGen;
+  [...$('presetBtns').children].forEach(b => b.classList.toggle('on', b === btn));
+  $('audioFile').value = '';   // the picker no longer describes what is loaded
+  try {
+    const bytes = await fetchWithProgress(track.file, track.name, gen);
+    if (gen !== state.analysisGen) return;
+    // copy into a blob for playback before decodeAudioData detaches the buffer
+    await ingest(bytes, new Blob([bytes]), gen);
+  } catch (e) {
+    failLoad(gen, `Could not load ${track.name} — ${e.message}. Is the file in the repo?`);
+  }
+}
+
+// streams the download so a 25 MB track shows progress instead of a dead pause
+async function fetchWithProgress(url, label, gen) {
+  status(`Fetching ${label}…`);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const total = +res.headers.get('content-length') || 0;
+  if (!res.body || !total) return res.arrayBuffer();
+  const reader = res.body.getReader();
+  const chunks = [];
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (gen !== state.analysisGen) { reader.cancel().catch(() => {}); throw new Error('superseded'); }
+    chunks.push(value);
+    got += value.length;
+    status(`Fetching ${label}… ${Math.round(got / total * 100)}%`);
+  }
+  const out = new Uint8Array(got);
+  let o = 0;
+  for (const c of chunks) { out.set(c, o); o += c.length; }
+  return out.buffer;
 }
 
 function status(msg, ok) {
