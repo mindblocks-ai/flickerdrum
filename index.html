@@ -223,6 +223,11 @@
       <button id="micBtn" class="btn2">Enable microphone</button>
       <span class="small" id="micStatus">The flicker rides your own drum as you play it, live.</span>
     </div>
+    <div class="row hidden" id="micDeviceRow">
+      <label class="small" for="micDevice">Input</label>
+      <select id="micDevice" style="max-width:100%"></select>
+      <span class="small" style="color:var(--dim)">pick the one whose Level moves when you hit the drum</span>
+    </div>
     <div class="row">
       <label class="small">Level</label>
       <div class="meter"><div id="micLevel"></div></div>
@@ -348,7 +353,7 @@ const state = {
   dphase: 0,               // drum-rate phase, 0 = a hit (rate-follow accumulates it)
   toneCtx: null, toneGate: null, toneVolNode: null,
   live: {                  // microphone beat tracker
-    ctx: null, analyser: null, buf: null,
+    ctx: null, analyser: null, buf: null, stream: null, monitoring: false,
     baseline: 0, lastOnset: 0, lastBeat: 0, ivs: [], period: 0, ready: false,
   },
 };
@@ -411,31 +416,72 @@ $('toneSync').addEventListener('change', updateToneNote);
 updateToneNote();
 
 /* ---------- live drum: microphone beat tracker ---------- */
-$('micBtn').addEventListener('click', async () => {
+$('micBtn').addEventListener('click', () => openMic());
+$('micDevice').addEventListener('change', () => openMic($('micDevice').value));
+// plugging or unplugging an interface while the panel is open refreshes the list
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+  navigator.mediaDevices.addEventListener('devicechange', () => {
+    if (state.live.stream) listMics(state.live.stream);
+  });
+}
+
+async function openMic(deviceId) {
+  const L = state.live;
   try {
+    // release the current device first — some drivers won't hand out a second
+    // capture on the same input
+    if (L.stream) L.stream.getTracks().forEach(t => t.stop());
+    if (L.ctx) { try { await L.ctx.close(); } catch (e) {} L.ctx = null; }
+
     // raw signal: browser echo/noise processing would eat the drum transients
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-    });
-    const L = state.live;
+    const audio = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+    if (deviceId) audio.deviceId = { exact: deviceId };
+    const stream = await navigator.mediaDevices.getUserMedia({ audio });
+
+    L.stream = stream;
     L.ctx = new (window.AudioContext || window.webkitAudioContext)();
     L.ctx.createMediaStreamSource(stream).connect(L.analyser = L.ctx.createAnalyser());
     L.analyser.fftSize = 2048;
     L.buf = new Float32Array(L.analyser.fftSize);
+    // a new device has its own noise floor and tempo history
+    L.baseline = 0; L.ivs = []; L.period = 0; L.lastBeat = 0; L.lastOnset = 0;
     L.ready = true;
     $('micBtn').textContent = 'Microphone live';
-    $('micBtn').disabled = true;
     $('micStatus').textContent = 'Hit the drum a few times so I can find your rate.';
+    await listMics(stream);
     updateBegin();
-    micMonitor();
+    if (!L.monitoring) { L.monitoring = true; micMonitor(); }
   } catch (e) {
+    L.ready = false;
     $('micStatus').textContent = 'Microphone unavailable: ' + (e.message || e);
+    updateBegin();
   }
-});
+}
+
+// device labels are only readable once permission has been granted, which is why
+// the picker appears after the first Enable rather than before it
+async function listMics(stream) {
+  try {
+    const ins = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput');
+    if (ins.length < 2) return;   // nothing to choose between
+    const track = stream.getAudioTracks()[0];
+    const cur = track && track.getSettings ? track.getSettings().deviceId : '';
+    const sel = $('micDevice');
+    sel.innerHTML = '';
+    ins.forEach((d, i) => {
+      const o = document.createElement('option');
+      o.value = d.deviceId;
+      o.textContent = d.label || `Microphone ${i + 1}`;
+      if (d.deviceId === cur) o.selected = true;
+      sel.appendChild(o);
+    });
+    $('micDeviceRow').classList.remove('hidden');
+  } catch (e) {}
+}
 
 function micMonitor() {
   const L = state.live;
-  if (!L.ctx) return;
+  if (!L.ctx) { L.monitoring = false; return; }
   L.analyser.getFloatTimeDomainData(L.buf);
   let s = 0;
   for (let i = 0; i < L.buf.length; i++) s += L.buf[i] * L.buf[i];
