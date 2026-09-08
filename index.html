@@ -1,0 +1,606 @@
+<title>Flickerdrum</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Marcellus&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --ink0: #0B0910;
+    --ink1: #141019;
+    --ink2: #201927;
+    --line: #2C2434;
+    --bone: #E9E3D6;
+    --dim:  #8D8398;
+    --ember:#E4572E;
+    --display: 'Marcellus', 'Georgia', serif;
+    --mono: 'IBM Plex Mono', 'Consolas', monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--ink0);
+    color: var(--bone);
+    font-family: var(--mono);
+    font-size: 14px;
+    line-height: 1.55;
+  }
+  button, input, select { font-family: var(--mono); font-size: 14px; color: var(--bone); }
+  :focus-visible { outline: 2px solid var(--ember); outline-offset: 2px; }
+
+  /* ---------- warning gate ---------- */
+  #gate {
+    position: fixed; inset: 0; z-index: 40;
+    background: var(--ink0);
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px;
+  }
+  .gate-card { max-width: 34rem; text-align: center; }
+  .gate-card h1 {
+    font-family: var(--display); font-weight: 400;
+    font-size: 2rem; letter-spacing: .12em; text-transform: uppercase;
+    margin: 0 0 1rem; text-wrap: balance;
+  }
+  .gate-card p { color: var(--dim); margin: 0 0 .8rem; }
+  .gate-card p strong { color: var(--bone); font-weight: 600; }
+  .gate-card .warn {
+    border: 1px solid var(--line); border-left: 3px solid var(--ember);
+    background: var(--ink1); text-align: left;
+    padding: 14px 16px; margin: 1.4rem 0;
+  }
+  #gate button {
+    background: var(--ember); border: none; color: #14060A;
+    font-weight: 600; letter-spacing: .06em;
+    padding: 12px 28px; cursor: pointer; margin-top: .4rem;
+  }
+  #gate button:hover { filter: brightness(1.1); }
+
+  /* ---------- panel ---------- */
+  #panel { max-width: 42rem; margin: 0 auto; padding: 40px 20px 64px; }
+  header.brand { text-align: center; margin-bottom: 2.2rem; }
+  header.brand h1 {
+    font-family: var(--display); font-weight: 400;
+    font-size: 2.4rem; letter-spacing: .18em; text-transform: uppercase;
+    margin: 0;
+  }
+  header.brand p { color: var(--dim); margin: .3rem 0 0; font-size: 13px; }
+
+  fieldset {
+    border: 1px solid var(--line); background: var(--ink1);
+    padding: 18px 20px 20px; margin: 0 0 18px;
+  }
+  legend {
+    font-size: 11px; letter-spacing: .18em; text-transform: uppercase;
+    color: var(--dim); padding: 0 8px;
+  }
+  .row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .row + .row { margin-top: 14px; }
+  label.small { font-size: 12px; color: var(--dim); }
+
+  .tabs { display: flex; gap: 0; margin-bottom: 18px; border: 1px solid var(--line); }
+  .tabs button {
+    flex: 1; background: var(--ink1); border: none; cursor: pointer;
+    padding: 12px 8px; letter-spacing: .05em; color: var(--dim);
+  }
+  .tabs button.active { background: var(--ink2); color: var(--bone); box-shadow: inset 0 -2px 0 var(--ember); }
+
+  input[type=range] { flex: 1; accent-color: var(--ember); min-width: 140px; }
+  input[type=number] {
+    width: 5.5em; background: var(--ink0); border: 1px solid var(--line);
+    padding: 6px 8px; font-variant-numeric: tabular-nums;
+  }
+  select { background: var(--ink0); border: 1px solid var(--line); padding: 6px 8px; }
+  input[type=color] {
+    width: 44px; height: 32px; padding: 2px; background: var(--ink0);
+    border: 1px solid var(--line); cursor: pointer;
+  }
+  input[type=file] { color: var(--dim); font-size: 12px; max-width: 100%; }
+  input[type=file]::file-selector-button {
+    background: var(--ink2); border: 1px solid var(--line); color: var(--bone);
+    padding: 8px 14px; margin-right: 12px; cursor: pointer; font-family: var(--mono);
+  }
+
+  .readout {
+    font-variant-numeric: tabular-nums; color: var(--ember); font-weight: 600;
+    min-width: 4.5em; text-align: right;
+  }
+  #analysisStatus { font-size: 12px; color: var(--dim); }
+  #analysisStatus.ok { color: var(--ember); }
+  #curveWrap { margin-top: 14px; display: none; }
+  #curve { width: 100%; height: 90px; display: block; background: var(--ink0); border: 1px solid var(--line); }
+  #curveCaption { font-size: 11px; color: var(--dim); margin-top: 4px; }
+
+  #begin {
+    display: block; width: 100%; margin-top: 6px;
+    background: var(--ember); border: none; color: #14060A;
+    font-weight: 600; font-size: 16px; letter-spacing: .1em; text-transform: uppercase;
+    padding: 16px; cursor: pointer;
+  }
+  #begin:disabled { background: var(--ink2); color: var(--dim); cursor: not-allowed; }
+  #begin:not(:disabled):hover { filter: brightness(1.1); }
+  .footnote { color: var(--dim); font-size: 12px; text-align: center; margin-top: 14px; }
+  .hidden { display: none !important; }
+
+  /* ---------- flicker stage ---------- */
+  #stage {
+    position: fixed; inset: 0; z-index: 30; display: none;
+    background: #000; cursor: none;
+  }
+  #hud {
+    position: fixed; left: 16px; bottom: 14px; z-index: 31;
+    font-size: 12px; color: rgba(233,227,214,.65);
+    background: rgba(11,9,16,.55); padding: 6px 10px;
+    font-variant-numeric: tabular-nums;
+    transition: opacity .6s; pointer-events: none;
+  }
+  #hud.faded { opacity: 0; }
+</style>
+
+<div id="gate">
+  <div class="gate-card">
+    <h1>Flickerdrum</h1>
+    <p>A full-field ganzflicker that listens to a drumming track and locks its flicker to a multiple of the drum rate.</p>
+    <div class="warn">
+      <p><strong>Photosensitive seizure warning.</strong> This page produces intense full-screen flashing light. Do not use it if you have epilepsy, a history of photosensitive seizures, or any doubt about your neurological response to strobe light. Stop immediately if you feel unwell.</p>
+      <p style="margin:0">It stops instantly: <strong>click anywhere or press any key.</strong></p>
+    </div>
+    <button id="acceptRisk">I understand the risk</button>
+  </div>
+</div>
+
+<main id="panel">
+  <header class="brand">
+    <h1>Flickerdrum</h1>
+    <p>the light follows the drum</p>
+  </header>
+
+  <div class="tabs" role="tablist">
+    <button id="tabDrum" class="active" role="tab" aria-selected="true">Follow the drum</button>
+    <button id="tabFixed" role="tab" aria-selected="false">Fixed rate</button>
+  </div>
+
+  <fieldset id="drumControls">
+    <legend>Drum track</legend>
+    <div class="row">
+      <input type="file" id="audioFile" accept="audio/*">
+    </div>
+    <div class="row">
+      <label class="small" for="drumBand">Drum speed band</label>
+      <select id="drumBand">
+        <option value="1.5,3">Slow · 1.5–3 Hz</option>
+        <option value="2.8,5.6" selected>Shamanic · 2.8–5.6 Hz</option>
+        <option value="4,8">Fast · 4–8 Hz</option>
+      </select>
+      <span id="analysisStatus">Upload a track to read its tempo.</span>
+    </div>
+    <div class="row">
+      <label class="small" for="mult">Flicker = drum ×</label>
+      <input type="number" id="mult" value="2" min="0.5" max="6" step="0.5">
+      <span id="multPreview" class="small" style="color:var(--dim)"></span>
+    </div>
+    <div class="row">
+      <label class="small" for="syncMode">Sync</label>
+      <select id="syncMode">
+        <option value="beat" selected>Beat-locked · flashes ride each hit</option>
+        <option value="rate">Rate-follow · smooth frequency only</option>
+      </select>
+    </div>
+    <div id="curveWrap">
+      <canvas id="curve"></canvas>
+      <div id="curveCaption"></div>
+    </div>
+  </fieldset>
+
+  <fieldset id="fixedControls" class="hidden">
+    <legend>Fixed rate</legend>
+    <div class="row">
+      <label class="small" for="fixedHz">Flicker</label>
+      <input type="range" id="fixedHz" min="1" max="20" step="0.1" value="7.5">
+      <span class="readout"><span id="fixedHzVal">7.5</span> Hz</span>
+    </div>
+    <div class="row">
+      <label class="small" for="fixedMins">Session length</label>
+      <input type="number" id="fixedMins" value="10" min="0" max="120" step="1">
+      <label class="small">minutes (0 = until stopped)</label>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Colors</legend>
+    <div class="row">
+      <label class="small" for="colorA">Flash</label>
+      <input type="color" id="colorA" value="#ff0000">
+      <label class="small" for="colorB" style="margin-left:10px">Ground</label>
+      <input type="color" id="colorB" value="#000000">
+    </div>
+  </fieldset>
+
+  <button id="begin" disabled>Begin</button>
+  <p class="footnote">Runs fullscreen. Click anywhere or press any key to stop instantly.</p>
+</main>
+
+<div id="stage"></div>
+<div id="hud" class="hidden"></div>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+
+const state = {
+  mode: 'drum',            // 'drum' | 'fixed'
+  buffer: null,            // decoded AudioBuffer
+  curve: null,             // { times: [], hz: [], conf: [] }
+  ctx: null,               // AudioContext
+  source: null,
+  startCtxTime: 0,
+  running: false,
+  phase: 0,
+  lastFrame: 0,
+  curveIdx: 0,
+  endAt: Infinity,         // seconds (fixed mode timer)
+  raf: 0,
+  hudTimer: 0,
+};
+
+/* ---------- gate ---------- */
+$('acceptRisk').addEventListener('click', () => { $('gate').remove(); });
+
+/* ---------- tabs ---------- */
+function setMode(mode) {
+  state.mode = mode;
+  const drum = mode === 'drum';
+  $('tabDrum').classList.toggle('active', drum);
+  $('tabFixed').classList.toggle('active', !drum);
+  $('tabDrum').setAttribute('aria-selected', drum);
+  $('tabFixed').setAttribute('aria-selected', !drum);
+  $('drumControls').classList.toggle('hidden', !drum);
+  $('fixedControls').classList.toggle('hidden', drum);
+  updateBegin();
+}
+$('tabDrum').addEventListener('click', () => setMode('drum'));
+$('tabFixed').addEventListener('click', () => setMode('fixed'));
+
+function updateBegin() {
+  $('begin').disabled = state.mode === 'drum' && !state.curve;
+}
+
+/* ---------- fixed controls ---------- */
+$('fixedHz').addEventListener('input', () => { $('fixedHzVal').textContent = (+$('fixedHz').value).toFixed(1); });
+
+/* ---------- analysis ---------- */
+$('audioFile').addEventListener('change', loadAudio);
+$('drumBand').addEventListener('change', () => { if (state.buffer) analyze(); });
+$('mult').addEventListener('input', updateMultPreview);
+
+async function loadAudio() {
+  const file = $('audioFile').files[0];
+  if (!file) return;
+  status('Decoding audio…');
+  try {
+    const bytes = await file.arrayBuffer();
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    state.buffer = await ctx.decodeAudioData(bytes);
+    ctx.close();
+    await analyze();
+  } catch (e) {
+    status('Could not decode that file — try mp3/wav/ogg.');
+    state.buffer = null; state.curve = null; updateBegin();
+  }
+}
+
+function status(msg, ok) {
+  const el = $('analysisStatus');
+  el.textContent = msg;
+  el.classList.toggle('ok', !!ok);
+}
+
+async function analyze() {
+  const buf = state.buffer;
+  status('Reading the drum…');
+  state.curve = null; updateBegin();
+  await new Promise(r => setTimeout(r, 30));  // let the status paint
+
+  const sr = buf.sampleRate;
+  // mono downmix
+  const n = buf.length;
+  const mono = new Float32Array(n);
+  for (let ch = 0; ch < buf.numberOfChannels; ch++) {
+    const d = buf.getChannelData(ch);
+    for (let i = 0; i < n; i++) mono[i] += d[i];
+  }
+
+  // onset-strength envelope: RMS per hop, half-wave rectified flux
+  const hop = 512, frame = 1024;
+  const envRate = sr / hop;
+  const nFrames = Math.max(0, Math.floor((n - frame) / hop));
+  const env = new Float32Array(nFrames);
+  for (let f = 0; f < nFrames; f++) {
+    let s = 0; const o = f * hop;
+    for (let i = 0; i < frame; i++) { const v = mono[o + i]; s += v * v; }
+    env[f] = Math.sqrt(s / frame);
+  }
+  const onset = new Float32Array(nFrames);
+  for (let f = 1; f < nFrames; f++) onset[f] = Math.max(0, env[f] - env[f - 1]);
+
+  // where the sound actually enters: first 0.25 s of sustained energy above 10% of peak
+  let maxEnv = 0;
+  for (let f = 0; f < nFrames; f++) if (env[f] > maxEnv) maxEnv = env[f];
+  const thr = 0.1 * maxEnv;
+  const need = Math.round(0.25 * envRate);
+  let run = 0, activeStart = 0;
+  for (let f = 0; f < nFrames; f++) {
+    if (env[f] > thr) { run++; if (run >= need) { activeStart = (f - run + 1) / envRate; break; } }
+    else run = 0;
+  }
+
+  // sliding-window autocorrelation over the chosen one-octave band
+  const [hzLo, hzHi] = $('drumBand').value.split(',').map(Number);
+  const lagMin = Math.max(2, Math.round(envRate / hzHi));
+  const lagMax = Math.round(envRate / hzLo);
+  const win = Math.round(4 * envRate);          // 4 s window
+  const hopW = Math.round(0.5 * envRate);       // every 0.5 s
+  const times = [], hzs = [], confs = [];
+  let prevLag = 0;
+
+  for (let start = 0; start + win + lagMax < nFrames; start += hopW) {
+    let best = 0, bestLag = 0, sum = 0, cnt = 0;
+    for (let lag = lagMin; lag <= lagMax; lag++) {
+      let ac = 0;
+      for (let t = start; t < start + win; t++) ac += onset[t] * onset[t + lag];
+      sum += ac; cnt++;
+      // continuity bias: prefer a lag near the previous window's pick
+      const biased = prevLag ? ac * (1 - 0.25 * Math.min(1, Math.abs(lag - prevLag) / prevLag)) : ac;
+      if (biased > best) { best = biased; bestLag = lag; }
+    }
+    const mean = cnt ? sum / cnt : 0;
+    // parabolic interpolation around the winning lag for sub-frame precision
+    let lagF = bestLag;
+    if (bestLag > lagMin && bestLag < lagMax) {
+      const acAt = lag => { let s = 0; for (let t = start; t < start + win; t++) s += onset[t] * onset[t + lag]; return s; };
+      const y0 = acAt(bestLag - 1), y1 = acAt(bestLag), y2 = acAt(bestLag + 1);
+      const denom = y0 - 2 * y1 + y2;
+      if (Math.abs(denom) > 1e-12) lagF = bestLag + 0.5 * (y0 - y2) / denom;
+    }
+    const conf = mean > 0 ? best / mean : 0;
+    if (conf > 1.15 && bestLag) prevLag = bestLag;
+    times.push((start + win / 2) / envRate);
+    hzs.push(envRate / lagF);
+    confs.push(conf);
+    if (times.length % 200 === 0) await new Promise(r => setTimeout(r, 0));
+  }
+
+  if (!times.length) { status('Track too short to analyze (needs > 5 s).'); return; }
+
+  // low-confidence windows hold the previous value; then median-of-3 + light EMA
+  let lastGood = hzs[confs.indexOf(Math.max(...confs))];
+  for (let i = 0; i < hzs.length; i++) {
+    if (confs[i] < 1.15) hzs[i] = lastGood; else lastGood = hzs[i];
+  }
+  const med = hzs.slice();
+  for (let i = 1; i < hzs.length - 1; i++) {
+    const a = [hzs[i - 1], hzs[i], hzs[i + 1]].sort((x, y) => x - y);
+    med[i] = a[1];
+  }
+  for (let i = 1; i < med.length; i++) med[i] = med[i - 1] + 0.3 * (med[i] - med[i - 1]);
+
+  // beat extraction: predictive tracking of onset peaks along the tempo curve.
+  // Predict the next hit one period ahead, snap to the strongest onset in a ±35%
+  // window around it; if nothing convincing is there, place a ghost beat and move on.
+  const hzAt = t => {
+    if (t <= times[0]) return med[0];
+    if (t >= times[times.length - 1]) return med[med.length - 1];
+    let i = 0;
+    while (times[i + 1] < t) i++;
+    const f = (t - times[i]) / (times[i + 1] - times[i]);
+    return med[i] + f * (med[i + 1] - med[i]);
+  };
+  const onsetAt = f => onset[Math.max(0, Math.min(nFrames - 1, f))];
+  const refine = f => {  // parabolic interp for sub-frame hit position
+    const y0 = onsetAt(f - 1), y1 = onsetAt(f), y2 = onsetAt(f + 1);
+    const d = y0 - 2 * y1 + y2;
+    return Math.abs(d) > 1e-12 ? f + Math.max(-0.5, Math.min(0.5, 0.5 * (y0 - y2) / d)) : f;
+  };
+  const beats = [];
+  {
+    const startF = Math.round(activeStart * envRate);
+    const P0 = envRate / hzAt(activeStart);
+    let bestF = startF, bestV = -1;
+    for (let f = startF; f < Math.min(nFrames, startF + Math.round(2 * P0)); f++)
+      if (onset[f] > bestV) { bestV = onset[f]; bestF = f; }
+    let b = refine(bestF);
+    let strength = bestV;   // EMA of accepted hit strengths, for the ghost-beat test
+    beats.push(b / envRate);
+    while (true) {
+      const P = envRate / hzAt(b / envRate);
+      const expected = b + P;
+      if (expected >= nFrames - 2) break;
+      const lo = Math.max(0, Math.round(expected - 0.35 * P));
+      const hi = Math.min(nFrames - 1, Math.round(expected + 0.35 * P));
+      let pf = -1, pv = 0;
+      for (let f = lo; f <= hi; f++) if (onset[f] > pv) { pv = onset[f]; pf = f; }
+      if (pf >= 0 && pv > 0.15 * strength) {
+        b = refine(pf);
+        strength = 0.8 * strength + 0.2 * pv;
+      } else {
+        b = expected;
+      }
+      beats.push(b / envRate);
+    }
+  }
+
+  state.curve = { times, hz: med, conf: confs, activeStart, beats };
+  const lo = Math.min(...med), hi = Math.max(...med);
+  const enters = activeStart > 0.5 ? ` Drum enters at ${fmtTime(activeStart)}; the flicker waits for it.` : '';
+  status(`Drum read: ${lo.toFixed(2)}–${hi.toFixed(2)} Hz over ${fmtTime(buf.duration)}.${enters}`, true);
+  drawCurve();
+  updateMultPreview();
+  updateBegin();
+}
+
+function updateMultPreview() {
+  if (!state.curve) { $('multPreview').textContent = ''; return; }
+  const m = +$('mult').value || 2;
+  const lo = Math.min(...state.curve.hz) * m, hi = Math.max(...state.curve.hz) * m;
+  $('multPreview').textContent = `→ flicker ${lo.toFixed(2)}–${hi.toFixed(2)} Hz`;
+}
+
+function drawCurve() {
+  const { times, hz, conf } = state.curve;
+  const wrap = $('curveWrap'); wrap.style.display = 'block';
+  const cv = $('curve');
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext('2d');
+  g.scale(dpr, dpr);
+  g.clearRect(0, 0, w, h);
+  const lo = Math.min(...hz), hi = Math.max(...hz);
+  const pad = Math.max(0.1, (hi - lo) * 0.25);
+  const y = v => h - 8 - (v - (lo - pad)) / ((hi + pad) - (lo - pad)) * (h - 16);
+  const x = t => 4 + t / times[times.length - 1] * (w - 8);
+  // faint grid line at the midpoint
+  g.strokeStyle = 'rgba(140,131,152,.25)'; g.lineWidth = 1;
+  g.beginPath(); g.moveTo(0, y((lo + hi) / 2)); g.lineTo(w, y((lo + hi) / 2)); g.stroke();
+  // tempo line, dimmed where confidence was low
+  g.lineWidth = 1.5;
+  for (let i = 1; i < times.length; i++) {
+    g.strokeStyle = conf[i] < 1.15 ? 'rgba(228,87,46,.3)' : 'rgba(228,87,46,.95)';
+    g.beginPath(); g.moveTo(x(times[i - 1]), y(hz[i - 1])); g.lineTo(x(times[i]), y(hz[i])); g.stroke();
+  }
+  $('curveCaption').textContent =
+    `Detected drum rate across the track (${lo.toFixed(2)}–${hi.toFixed(2)} Hz) · ${state.curve.beats.length} hits tracked. Dim segments = low confidence, value held.`;
+}
+
+/* ---------- run ---------- */
+$('begin').addEventListener('click', begin);
+
+async function begin() {
+  const stage = $('stage'), hud = $('hud');
+  state.running = true;
+  state.phase = 0;
+  state.curveIdx = 0;
+  state.beatIdx = 0;
+  state.lastFrame = performance.now();
+
+  if (state.mode === 'drum') {
+    state.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = state.ctx.createBufferSource();
+    src.buffer = state.buffer;
+    src.connect(state.ctx.destination);
+    src.onended = () => { if (state.running) stop(); };
+    state.source = src;
+    state.startCtxTime = state.ctx.currentTime;
+    src.start();
+    state.endAt = Infinity;
+  } else {
+    const mins = +$('fixedMins').value || 0;
+    state.endAt = mins > 0 ? mins * 60 : Infinity;
+    state.startWall = performance.now();
+  }
+
+  stage.style.display = 'block';
+  hud.classList.remove('hidden', 'faded');
+  if (document.documentElement.requestFullscreen) {
+    try { await document.documentElement.requestFullscreen(); } catch (e) {}
+  }
+  clearTimeout(state.hudTimer);
+  state.hudTimer = setTimeout(() => hud.classList.add('faded'), 4000);
+  state.raf = requestAnimationFrame(tick);
+}
+
+function currentDrumHz(t) {
+  const { times, hz } = state.curve;
+  if (t <= times[0]) return hz[0];
+  if (t >= times[times.length - 1]) return hz[hz.length - 1];
+  let i = state.curveIdx;
+  while (i < times.length - 1 && times[i + 1] < t) i++;
+  while (i > 0 && times[i] > t) i--;
+  state.curveIdx = i;
+  const f = (t - times[i]) / (times[i + 1] - times[i]);
+  return hz[i] + f * (hz[i + 1] - hz[i]);
+}
+
+// beat-locked phase: `mult` full flicker cycles per beat interval, phase 0 = a hit,
+// so a flash always lands exactly on each drum strike
+function beatPhase(t, m) {
+  const bs = state.curve.beats;
+  let i = state.beatIdx;
+  while (i < bs.length - 1 && bs[i + 1] <= t) i++;
+  while (i > 0 && bs[i] > t) i--;
+  state.beatIdx = i;
+  let b, P;
+  if (t < bs[0]) {                       // between drum entry and the first tracked hit
+    P = bs.length > 1 ? bs[1] - bs[0] : 1 / currentDrumHz(t);
+    return { phase: 0.75, hz: m / P };   // hold ground-color half of the cycle
+  }
+  if (i >= bs.length - 1) {              // past the last hit: keep the last period going
+    b = bs[bs.length - 1];
+    P = bs.length > 1 ? b - bs[bs.length - 2] : 1 / currentDrumHz(t);
+  } else {
+    b = bs[i];
+    P = bs[i + 1] - bs[i];
+  }
+  return { phase: ((t - b) / P * m) % 1, hz: m / P };
+}
+
+function tick(now) {
+  if (!state.running) return;
+  const dt = Math.min(0.1, (now - state.lastFrame) / 1000);
+  state.lastFrame = now;
+
+  let flickerHz, hudText;
+  if (state.mode === 'drum') {
+    const t = state.ctx.currentTime - state.startCtxTime;
+    if (t < state.curve.activeStart) {
+      // silence before the drum: hold the ground color, keep phase at 0 so the
+      // first flash lands on the drum's entry
+      state.phase = 0;
+      $('stage').style.background = $('colorB').value;
+      $('hud').textContent = `waiting for the drum · ${fmtTime(t)} / ${fmtTime(state.buffer.duration)}`;
+      state.raf = requestAnimationFrame(tick);
+      return;
+    }
+    const m = +$('mult').value || 2;
+    let drumHz;
+    if ($('syncMode').value === 'beat') {
+      const bp = beatPhase(t, m);
+      state.phase = bp.phase;
+      flickerHz = bp.hz;
+      drumHz = bp.hz / m;
+      hudText = `drum ${drumHz.toFixed(2)} Hz · flicker ${flickerHz.toFixed(2)} Hz · beat-locked · ${fmtTime(t)} / ${fmtTime(state.buffer.duration)}`;
+    } else {
+      drumHz = currentDrumHz(t);
+      flickerHz = drumHz * m;
+      state.phase = (state.phase + flickerHz * dt) % 1;
+      hudText = `drum ${drumHz.toFixed(2)} Hz · flicker ${flickerHz.toFixed(2)} Hz · rate-follow · ${fmtTime(t)} / ${fmtTime(state.buffer.duration)}`;
+    }
+  } else {
+    const t = (now - state.startWall) / 1000;
+    if (t >= state.endAt) { stop(); return; }
+    flickerHz = +$('fixedHz').value;
+    state.phase = (state.phase + flickerHz * dt) % 1;
+    hudText = `flicker ${flickerHz.toFixed(1)} Hz · ${fmtTime(t)}${state.endAt < Infinity ? ' / ' + fmtTime(state.endAt) : ''}`;
+  }
+  $('stage').style.background = state.phase < 0.5 ? $('colorA').value : $('colorB').value;
+  $('hud').textContent = hudText;
+  state.raf = requestAnimationFrame(tick);
+}
+
+function stop() {
+  if (!state.running) return;
+  state.running = false;
+  cancelAnimationFrame(state.raf);
+  clearTimeout(state.hudTimer);
+  if (state.source) { try { state.source.stop(); } catch (e) {} state.source = null; }
+  if (state.ctx) { state.ctx.close(); state.ctx = null; }
+  $('stage').style.display = 'none';
+  $('hud').classList.add('hidden');
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+}
+
+/* kill switch: any key, or any click on the stage */
+window.addEventListener('keydown', e => { if (state.running) { e.preventDefault(); stop(); } });
+$('stage').addEventListener('pointerdown', stop);
+
+function fmtTime(s) {
+  s = Math.max(0, Math.floor(s));
+  return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+</script>
