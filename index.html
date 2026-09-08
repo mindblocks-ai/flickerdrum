@@ -136,6 +136,23 @@
     transition: opacity .6s; pointer-events: none;
   }
   #hud.faded { opacity: 0; }
+
+  /* ---------- live drum ---------- */
+  .btn2 {
+    background: var(--ink2); border: 1px solid var(--line); color: var(--bone);
+    padding: 8px 14px; cursor: pointer;
+  }
+  .btn2:disabled { color: var(--dim); cursor: default; }
+  .meter { flex: 1; min-width: 120px; height: 8px; background: var(--ink0); border: 1px solid var(--line); }
+  .meter > div { height: 100%; background: var(--ember); width: 0%; }
+
+  /* ---------- return overlay ---------- */
+  #returnMsg {
+    position: fixed; inset: 0; z-index: 32;
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--display); font-size: 1.6rem; letter-spacing: .3em;
+    text-transform: uppercase; color: var(--bone); pointer-events: none;
+  }
 </style>
 
 <div id="gate">
@@ -158,6 +175,7 @@
 
   <div class="tabs" role="tablist">
     <button id="tabDrum" class="active" role="tab" aria-selected="true">Follow the drum</button>
+    <button id="tabLive" role="tab" aria-selected="false">Live drum</button>
     <button id="tabFixed" role="tab" aria-selected="false">Fixed rate</button>
   </div>
 
@@ -199,6 +217,31 @@
     </div>
   </fieldset>
 
+  <fieldset id="liveControls" class="hidden">
+    <legend>Live drum</legend>
+    <div class="row">
+      <button id="micBtn" class="btn2">Enable microphone</button>
+      <span class="small" id="micStatus">The flicker rides your own drum as you play it, live.</span>
+    </div>
+    <div class="row">
+      <label class="small">Level</label>
+      <div class="meter"><div id="micLevel"></div></div>
+      <span class="small" id="liveHzOut" style="color:var(--dim)">—</span>
+    </div>
+    <div class="row">
+      <label class="small" for="sens">Sensitivity</label>
+      <input type="range" id="sens" min="1.5" max="6" step="0.5" value="3">
+      <label class="small" for="liveMult" style="margin-left:10px">Flicker = drum ×</label>
+      <input type="number" id="liveMult" value="2" min="0.5" max="6" step="0.5">
+    </div>
+    <p class="hint" id="liveVerdict" style="margin:6px 0 0"></p>
+    <div class="row">
+      <label class="small" for="liveMins">Session length</label>
+      <input type="number" id="liveMins" value="0" min="0" max="120" step="1">
+      <label class="small">minutes (0 = until stopped)</label>
+    </div>
+  </fieldset>
+
   <fieldset id="fixedControls" class="hidden">
     <legend>Fixed rate</legend>
     <div class="row">
@@ -234,12 +277,51 @@
     </div>
   </fieldset>
 
+  <fieldset>
+    <legend>Tone &amp; Arc</legend>
+    <div class="row">
+      <label class="small" for="tone">Isochronic tone</label>
+      <select id="tone">
+        <option value="off" selected>Off</option>
+        <option value="on">On</option>
+      </select>
+      <label class="small" for="toneSync">Pulses</label>
+      <select id="toneSync">
+        <option value="beat" selected>On each drum hit · reinforces the drum</option>
+        <option value="light">With every light flash</option>
+      </select>
+    </div>
+    <div class="row">
+      <label class="small" for="toneHz">Carrier</label>
+      <input type="number" id="toneHz" value="210" min="60" max="500" step="5">
+      <label class="small" for="toneVol">Volume</label>
+      <input type="range" id="toneVol" min="0" max="100" value="30" style="max-width:100px">
+      <span class="small" id="toneNote" style="color:var(--dim)"></span>
+    </div>
+    <div class="row">
+      <label class="small" for="fadeIn">Fade-in</label>
+      <select id="fadeIn">
+        <option value="0">None</option>
+        <option value="15">15 s</option>
+        <option value="30" selected>30 s</option>
+        <option value="60">60 s</option>
+        <option value="120">120 s</option>
+      </select>
+      <label class="small" for="callback">Return</label>
+      <select id="callback">
+        <option value="chime" selected>Chime + welcome back at the end</option>
+        <option value="off">Off</option>
+      </select>
+    </div>
+  </fieldset>
+
   <button id="begin" disabled>Begin</button>
   <p class="footnote">Runs fullscreen. Click anywhere or press any key to stop instantly.</p>
 </main>
 
 <div id="stage"></div>
 <div id="hud" class="hidden"></div>
+<div id="returnMsg" class="hidden">welcome back</div>
 <audio id="player"></audio>
 
 <script>
@@ -256,31 +338,48 @@ const state = {
   phase: 0,
   lastFrame: 0,
   curveIdx: 0,
-  endAt: Infinity,         // seconds (fixed mode timer)
+  endAt: Infinity,         // seconds (fixed/live mode timer)
   raf: 0,
   hudTimer: 0,
+  analysisGen: 0,          // increments per load/band-change; stale analyses bail out
+  lastMediaT: -1,          // media-clock interpolation (some browsers update coarsely)
+  lastMediaWall: 0,
+  toneW: 0,                // current tone gate weight (may run at the drum's rate, not the light's)
+  dphase: 0,               // drum-rate phase, 0 = a hit (rate-follow accumulates it)
+  toneCtx: null, toneGate: null, toneVolNode: null,
+  live: {                  // microphone beat tracker
+    ctx: null, analyser: null, buf: null,
+    baseline: 0, lastOnset: 0, lastBeat: 0, ivs: [], period: 0, ready: false,
+  },
 };
 
 /* ---------- gate ---------- */
 $('acceptRisk').addEventListener('click', () => { $('gate').remove(); });
 
 /* ---------- tabs ---------- */
+const MODE_TABS = { drum: 'tabDrum', live: 'tabLive', fixed: 'tabFixed' };
 function setMode(mode) {
   state.mode = mode;
-  const drum = mode === 'drum';
-  $('tabDrum').classList.toggle('active', drum);
-  $('tabFixed').classList.toggle('active', !drum);
-  $('tabDrum').setAttribute('aria-selected', drum);
-  $('tabFixed').setAttribute('aria-selected', !drum);
-  $('drumControls').classList.toggle('hidden', !drum);
-  $('fixedControls').classList.toggle('hidden', drum);
+  for (const [m, id] of Object.entries(MODE_TABS)) {
+    $(id).classList.toggle('active', m === mode);
+    $(id).setAttribute('aria-selected', String(m === mode));
+  }
+  $('drumControls').classList.toggle('hidden', mode !== 'drum');
+  $('liveControls').classList.toggle('hidden', mode !== 'live');
+  $('fixedControls').classList.toggle('hidden', mode !== 'fixed');
   updateBegin();
+  updateToneNote();   // the tone note describes the current mode
+  // canvases drawn while this tab was hidden rendered at 0×0 — redraw now
+  if (mode === 'drum' && state.curve) drawCurve();
 }
 $('tabDrum').addEventListener('click', () => setMode('drum'));
+$('tabLive').addEventListener('click', () => setMode('live'));
 $('tabFixed').addEventListener('click', () => setMode('fixed'));
 
 function updateBegin() {
-  $('begin').disabled = state.mode === 'drum' && !state.curve;
+  $('begin').disabled =
+    state.mode === 'drum' ? !state.curve :
+    state.mode === 'live' ? !state.live.ready : false;
 }
 
 /* ---------- fixed controls ---------- */
@@ -294,6 +393,80 @@ function updateFixedNote() {
 $('fixedHz').addEventListener('input', updateFixedNote);
 updateFixedNote();
 $('bright').addEventListener('input', () => { $('brightOut').textContent = $('bright').value + '%'; });
+$('toneVol').addEventListener('input', () => {
+  if (state.toneVolNode) state.toneVolNode.gain.value = 0.4 * (+$('toneVol').value / 100);
+});
+// says what will actually happen in the mode you're in — "per drum hit" is
+// meaningless in fixed rate, where there is no drum to ride
+function updateToneNote() {
+  const onBeat = $('toneSync').value === 'beat';
+  $('toneSync').disabled = state.mode === 'fixed';   // both options mean the same with no drum
+  $('toneNote').textContent = $('tone').value !== 'on' ? ''
+    : state.mode === 'fixed' ? 'a pulse on every flash'
+    : onBeat ? 'one pulse per drum hit'
+    : 'a pulse on every flash — denser than the drum';
+}
+$('tone').addEventListener('change', updateToneNote);
+$('toneSync').addEventListener('change', updateToneNote);
+updateToneNote();
+
+/* ---------- live drum: microphone beat tracker ---------- */
+$('micBtn').addEventListener('click', async () => {
+  try {
+    // raw signal: browser echo/noise processing would eat the drum transients
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    });
+    const L = state.live;
+    L.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    L.ctx.createMediaStreamSource(stream).connect(L.analyser = L.ctx.createAnalyser());
+    L.analyser.fftSize = 2048;
+    L.buf = new Float32Array(L.analyser.fftSize);
+    L.ready = true;
+    $('micBtn').textContent = 'Microphone live';
+    $('micBtn').disabled = true;
+    $('micStatus').textContent = 'Hit the drum a few times so I can find your rate.';
+    updateBegin();
+    micMonitor();
+  } catch (e) {
+    $('micStatus').textContent = 'Microphone unavailable: ' + (e.message || e);
+  }
+});
+
+function micMonitor() {
+  const L = state.live;
+  if (!L.ctx) return;
+  L.analyser.getFloatTimeDomainData(L.buf);
+  let s = 0;
+  for (let i = 0; i < L.buf.length; i++) s += L.buf[i] * L.buf[i];
+  const e = Math.sqrt(s / L.buf.length);
+  L.baseline = 0.995 * (L.baseline || e) + 0.005 * e;   // slow floor estimate
+  const tNow = performance.now() / 1000;
+  if (e > Math.max(0.004, L.baseline * +$('sens').value) && tNow - L.lastOnset > 0.15) {
+    const d = tNow - L.lastOnset;
+    L.lastOnset = L.lastBeat = tNow;
+    if (d > 0.15 && d < 1.5) {
+      L.ivs.push(d);
+      if (L.ivs.length > 8) L.ivs.shift();
+      L.period = medianOf(L.ivs);
+    }
+  }
+  $('micLevel').style.width = Math.min(100, e * 600) + '%';
+  updateLiveReadout();
+  requestAnimationFrame(micMonitor);
+}
+
+function updateLiveReadout() {
+  const L = state.live;
+  if (!L.period) { $('liveHzOut').textContent = 'listening…'; return; }
+  const m = Math.max(1, Math.round(+$('liveMult').value || 2));
+  const f = m / L.period;
+  $('liveHzOut').textContent = `drum ${(1 / L.period).toFixed(2)} Hz`;
+  const v = rateVerdict(f, f, f);
+  $('liveVerdict').textContent = `→ flicker ${f.toFixed(2)} Hz` + (v.msg ? ' · ' + v.msg : '');
+  $('liveVerdict').style.color = v.color;
+}
+$('liveMult').addEventListener('input', updateLiveReadout);
 
 /* ---------- analysis ---------- */
 $('audioFile').addEventListener('change', loadAudio);
@@ -303,6 +476,7 @@ $('mult').addEventListener('input', updateMultPreview);
 async function loadAudio() {
   const file = $('audioFile').files[0];
   if (!file) return;
+  const gen = ++state.analysisGen;
   status('Decoding audio…');
   try {
     if (state.audioURL) URL.revokeObjectURL(state.audioURL);
@@ -312,12 +486,20 @@ async function loadAudio() {
     // decode a low-rate copy for analysis only — onsets don't need 44.1 kHz,
     // and a 30-minute track decoded full-rate is ~600 MB of floats
     const bytes = await file.arrayBuffer();
-    const octx = new OfflineAudioContext(1, 1, 11025);
-    state.buffer = await octx.decodeAudioData(bytes);
-    await analyze();
+    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    let decoded;
+    try {
+      decoded = await new OAC(1, 1, 11025).decodeAudioData(bytes.slice(0));
+    } catch (eLow) {                       // some WebKit builds reject low-rate contexts
+      decoded = await new OAC(1, 1, 44100).decodeAudioData(bytes);
+    }
+    if (gen !== state.analysisGen) return; // a newer file was picked meanwhile
+    state.buffer = decoded;
+    await analyze(gen);
   } catch (e) {
+    if (gen !== state.analysisGen) return;
     status('Could not decode that file — try mp3/wav/ogg.');
-    state.buffer = null; state.curve = null; updateBegin();
+    state.buffer = null; state.curve = null; updateBegin(); clearAnalysisUI();
   }
 }
 
@@ -327,11 +509,19 @@ function status(msg, ok) {
   el.classList.toggle('ok', !!ok);
 }
 
-async function analyze() {
+// a failed or too-short load must not leave the previous track's curve,
+// raster, and verdict on screen describing a file that isn't loaded
+function clearAnalysisUI() {
+  $('curveWrap').style.display = 'none';
+  updateMultPreview();
+}
+
+async function analyze(gen = ++state.analysisGen) {
   const buf = state.buffer;
   status('Reading the drum…');
   state.curve = null; updateBegin();
   await new Promise(r => setTimeout(r, 30));  // let the status paint
+  if (gen !== state.analysisGen) return;      // superseded by a newer file/band
 
   const sr = buf.sampleRate;
   // mono downmix
@@ -429,10 +619,13 @@ async function analyze() {
     times.push((start + win / 2) / envRate);
     hzs.push(envRate / lagF);
     confs.push(conf);
-    if (times.length % 200 === 0) await new Promise(r => setTimeout(r, 0));
+    if (times.length % 200 === 0) {
+      await new Promise(r => setTimeout(r, 0));
+      if (gen !== state.analysisGen) return;  // superseded by a newer file/band
+    }
   }
 
-  if (!times.length) { status('Track too short to analyze (needs > 5 s).'); return; }
+  if (!times.length) { status('Track too short to analyze (needs > 5 s).'); clearAnalysisUI(); return; }
 
   // low-confidence windows hold the previous value; then median-of-3 + light EMA
   let lastGood = hzs[confs.indexOf(Math.max(...confs))];
@@ -514,7 +707,8 @@ async function analyze() {
 // 15–25 flashes/s is the most seizure-provocative band; ~6–13 Hz (theta–alpha)
 // is where the ganzflicker imagery literature points.
 function rateVerdict(lo, hi, med) {
-  if (hi >= 15 && lo <= 25) return { color: '#FFB020', msg: '⚠ enters 15–25 Hz — the highest seizure-risk band' };
+  // no upper cutoff: rates above 25 Hz are still provocative (guidance runs to ~60 Hz)
+  if (hi >= 15) return { color: '#FFB020', msg: '⚠ reaches 15+ Hz — seizure-risk flash rates (worst band 15–25 Hz)' };
   if (med >= 6 && med <= 13) return { color: '#8FBF6F', msg: '✓ in the 6–13 Hz theta–alpha sweet spot for flicker imagery' };
   return { color: 'var(--dim)', msg: '' };
 }
@@ -522,12 +716,17 @@ function rateVerdict(lo, hi, med) {
 function updateMultPreview() {
   const el = $('multPreview');
   if (!state.curve) { el.textContent = ''; return; }
-  const m = +$('mult').value || 2;
+  const raw = +$('mult').value || 2;
+  const beat = $('syncMode').value === 'beat';
+  const m = beat ? Math.max(1, Math.round(raw)) : raw;   // beat-locked needs whole cycles per hit
   const lo = Math.min(...state.curve.hz) * m, hi = Math.max(...state.curve.hz) * m;
   const v = rateVerdict(lo, hi, state.curve.median * m);
-  el.textContent = `→ flicker ${lo.toFixed(2)}–${hi.toFixed(2)} Hz, median ${(state.curve.median * m).toFixed(2)}` + (v.msg ? ' · ' + v.msg : '');
+  el.textContent = `→ flicker ${lo.toFixed(2)}–${hi.toFixed(2)} Hz, median ${(state.curve.median * m).toFixed(2)}`
+    + (beat && m !== raw ? ` · beat-locked uses ×${m}` : '')
+    + (v.msg ? ' · ' + v.msg : '');
   el.style.color = v.color;
 }
+$('syncMode').addEventListener('change', updateMultPreview);
 
 function drawCurve() {
   const { times, hz, conf } = state.curve;
@@ -585,6 +784,8 @@ async function begin() {
   const stage = $('stage'), hud = $('hud');
   state.running = true;
   state.phase = 0;
+  state.dphase = 0;
+  state.toneW = 0;
   state.curveIdx = 0;
   state.beatIdx = 0;
   state.lastFrame = performance.now();
@@ -592,21 +793,44 @@ async function begin() {
   if (state.mode === 'drum') {
     const player = $('player');
     player.currentTime = 0;
-    player.onended = () => { if (state.running) stop(); };
-    try { await player.play(); } catch (e) {}
+    player.onended = () => { if (state.running) stop(true); };
+    player.onerror = () => { if (state.running) { stop(); status('Audio playback failed.'); } };
+    try {
+      await player.play();
+    } catch (e) {
+      // a session with no audio would hang on "waiting for the drum" forever
+      stop();
+      status('Could not start the audio — try re-selecting the file.');
+      return;
+    }
+    if (!state.running) return;   // stopped while the audio was spinning up
+    state.lastMediaT = -1;
     state.endAt = Infinity;
+  } else if (state.mode === 'live') {
+    const mins = +$('liveMins').value || 0;
+    state.endAt = mins > 0 ? mins * 60 : Infinity;
+    state.startWall = performance.now();
   } else {
     const mins = +$('fixedMins').value || 0;
     state.endAt = mins > 0 ? mins * 60 : Infinity;
     state.startWall = performance.now();
   }
+  startTone();
 
   stage.style.display = 'block';
   hud.classList.remove('hidden', 'faded');
   if (document.documentElement.requestFullscreen) {
     try { await document.documentElement.requestFullscreen(); } catch (e) {}
   }
+  if (!state.running) {           // stopped during the fullscreen transition
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    return;
+  }
   try { state.wake = await navigator.wakeLock.request('screen'); } catch (e) {}
+  if (!state.running) {           // stopped while the wake lock was being granted
+    if (state.wake) { state.wake.release().catch(() => {}); state.wake = null; }
+    return;
+  }
   clearTimeout(state.hudTimer);
   state.hudTimer = setTimeout(() => hud.classList.add('faded'), 4000);
   state.raf = requestAnimationFrame(tick);
@@ -635,7 +859,7 @@ function beatPhase(t, m) {
   let b, P;
   if (t < bs[0]) {                       // between drum entry and the first tracked hit
     P = bs.length > 1 ? bs[1] - bs[0] : 1 / currentDrumHz(t);
-    return { phase: 0.75, hz: m / P };   // hold ground-color half of the cycle
+    return { phase: 0.5, phase1: 0.5, hz: m / P };  // 0.5 maps to ground in BOTH edge shapes (hard and cosine)
   }
   if (i >= bs.length - 1) {              // past the last hit: keep the last period going
     b = bs[bs.length - 1];
@@ -644,79 +868,175 @@ function beatPhase(t, m) {
     b = bs[i];
     P = bs[i + 1] - bs[i];
   }
-  return { phase: ((t - b) / P * m) % 1, hz: m / P };
+  // phase1 is the same anchor at 1× — one cycle per hit — for the tone to ride
+  return { phase: ((t - b) / P * m) % 1, phase1: ((t - b) / P) % 1, hz: m / P };
 }
 
-// one frame of flicker logic, shared by the 2D stage and the VR loop:
-// advances the phase and returns { color, hud } (or { stop: true } at session end)
+// one frame of flicker logic: advances the phase and returns { color, hud }
+// (or { stop: true, natural: true } when the session ends on its own)
 function advance(now) {
   const dt = Math.min(0.1, (now - state.lastFrame) / 1000);
   state.lastFrame = now;
 
-  let flickerHz, hudText;
+  let flickerHz, hudText, arcE, dphase;   // arcE = seconds since the flicker started (drives fade-in);
+                                          // dphase = drum-rate phase, undefined when there is no drum
   if (state.mode === 'drum') {
-    const t = $('player').currentTime;
+    const pl = $('player');
+    let t = pl.currentTime;
+    // some browsers update the media clock coarsely; interpolate between updates
+    if (t !== state.lastMediaT) { state.lastMediaT = t; state.lastMediaWall = now; }
+    else if (!pl.paused) t += (now - state.lastMediaWall) / 1000;
     if (t < state.curve.activeStart) {
       // silence before the drum: hold the ground color, keep phase at 0 so the
       // first flash lands on the drum's entry
-      state.phase = 0;
+      state.phase = 0; state.toneW = 0;
       return { color: $('colorB').value, hud: `waiting for the drum · ${fmtTime(t)} / ${fmtTime(state.buffer.duration)}` };
     }
+    arcE = t - state.curve.activeStart;
     const m = +$('mult').value || 2;
     let drumHz;
     if ($('syncMode').value === 'beat') {
-      const bp = beatPhase(t, m);
+      // whole cycles per hit only: a fractional multiplier would truncate the
+      // cycle at each per-hit phase reset (×0.5 renders a constant color)
+      const mB = Math.max(1, Math.round(m));
+      const bp = beatPhase(t, mB);
       state.phase = bp.phase;
+      dphase = bp.phase1;
       flickerHz = bp.hz;
-      drumHz = bp.hz / m;
+      drumHz = bp.hz / mB;
       hudText = `drum ${drumHz.toFixed(2)} Hz · flicker ${flickerHz.toFixed(2)} Hz · beat-locked · ${fmtTime(t)} / ${fmtTime(state.buffer.duration)}`;
     } else {
       drumHz = currentDrumHz(t);
       flickerHz = drumHz * m;
       state.phase = (state.phase + flickerHz * dt) % 1;
+      dphase = state.dphase = (state.dphase + drumHz * dt) % 1;
       hudText = `drum ${drumHz.toFixed(2)} Hz · flicker ${flickerHz.toFixed(2)} Hz · rate-follow · ${fmtTime(t)} / ${fmtTime(state.buffer.duration)}`;
     }
+  } else if (state.mode === 'live') {
+    const t = (now - state.startWall) / 1000;
+    if (t >= state.endAt) return { stop: true, natural: true };
+    const L = state.live;
+    if (!L.lastBeat) {
+      state.phase = 0; state.toneW = 0;
+      return { color: $('colorB').value, hud: 'waiting for the first hit — play your drum' };
+    }
+    arcE = t;
+    // whole cycles per hit, same reason as beat-locked mode
+    const m = Math.max(1, Math.round(+$('liveMult').value || 2));
+    const P = L.period || 0.3;
+    // phase re-anchors to the latest live hit; between hits it runs at the median period
+    state.phase = ((now / 1000 - L.lastBeat) / P * m) % 1;
+    dphase = ((now / 1000 - L.lastBeat) / P) % 1;
+    flickerHz = m / P;
+    hudText = `drum ${(1 / P).toFixed(2)} Hz · flicker ${flickerHz.toFixed(2)} Hz · live · ${fmtTime(t)}${state.endAt < Infinity ? ' / ' + fmtTime(state.endAt) : ''}`;
   } else {
     const t = (now - state.startWall) / 1000;
-    if (t >= state.endAt) return { stop: true };
+    if (t >= state.endAt) return { stop: true, natural: true };
+    arcE = t;
     flickerHz = +$('fixedHz').value;
     state.phase = (state.phase + flickerHz * dt) % 1;
     hudText = `flicker ${flickerHz.toFixed(1)} Hz · ${fmtTime(t)}${state.endAt < Infinity ? ' / ' + fmtTime(state.endAt) : ''}`;
   }
-  return { color: mixColor(state.phase), hud: hudText };
+
+  const fadeS = +$('fadeIn').value;
+  const fadeF = fadeS > 0 ? Math.min(1, arcE / fadeS) : 1;
+  const pulse = shapePulse(state.phase) * fadeF;
+  // By default the tone rides the DRUM (one pulse per hit, landing on the strike) so
+  // it reinforces the drumming; following the light instead would put a tone blip in
+  // the gap between hits at any multiplier above 1. With no drum it follows the light.
+  const tp = ($('toneSync').value === 'beat' && dphase !== undefined) ? dphase : state.phase;
+  state.toneW = shapePulse(tp) * fadeF;
+  return { color: mixColor(pulse * (+$('bright').value / 100)), hud: hudText };
 }
 
-// luminance shaping: hard = square wave, soft = cosine fade between ground and
-// flash; brightness caps how far toward the flash color the blend reaches
+// luminance shaping: hard = square wave, soft = cosine fade between ground and flash
+function shapePulse(p) {
+  return $('edge').value === 'hard' ? (p < 0.5 ? 1 : 0) : 0.5 * (1 + Math.cos(2 * Math.PI * p));
+}
 function hex3(hex) {
   const v = parseInt(hex.slice(1), 16);
   return [v >> 16 & 255, v >> 8 & 255, v & 255];
 }
-function mixColor(p) {
-  let w = $('edge').value === 'hard' ? (p < 0.5 ? 1 : 0) : 0.5 * (1 + Math.cos(2 * Math.PI * p));
-  w *= (+$('bright').value) / 100;
+function mixColor(w) {
   const A = hex3($('colorA').value), B = hex3($('colorB').value);
   return `rgb(${Math.round(B[0] + (A[0] - B[0]) * w)},${Math.round(B[1] + (A[1] - B[1]) * w)},${Math.round(B[2] + (A[2] - B[2]) * w)})`;
+}
+
+/* ---------- isochronic tone: a carrier gated by the same pulse as the light ---------- */
+function startTone() {
+  if ($('tone').value !== 'on') return;
+  try {
+    const c = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = c.createOscillator();
+    osc.frequency.value = +$('toneHz').value || 210;
+    const gate = c.createGain(); gate.gain.value = 0;
+    const vol = c.createGain(); vol.gain.value = 0.4 * (+$('toneVol').value / 100);
+    osc.connect(gate); gate.connect(vol); vol.connect(c.destination);
+    osc.start();
+    state.toneCtx = c; state.toneGate = gate; state.toneVolNode = vol;
+  } catch (e) {}
+}
+function stopTone() {
+  if (state.toneCtx) {
+    try { state.toneCtx.close(); } catch (e) {}
+    state.toneCtx = null; state.toneGate = null; state.toneVolNode = null;
+  }
+}
+
+// soft synthesized bell for the return signal
+function chime() {
+  try {
+    const c = new (window.AudioContext || window.webkitAudioContext)();
+    if (c.state === 'suspended') c.resume().catch(() => {});
+    const g = c.createGain(); g.connect(c.destination);
+    g.gain.setValueAtTime(0.0001, c.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.22, c.currentTime + 0.03);
+    g.gain.exponentialRampToValueAtTime(0.0001, c.currentTime + 3.5);
+    [196, 392, 588, 784].forEach((f, i) => {
+      const o = c.createOscillator(); o.frequency.value = f;
+      const og = c.createGain(); og.gain.value = 1 / (i + 1);
+      o.connect(og); og.connect(g);
+      o.start(); o.stop(c.currentTime + 3.6);
+    });
+    setTimeout(() => { try { c.close(); } catch (e) {} }, 4000);
+  } catch (e) {}
 }
 
 function tick(now) {
   if (!state.running) return;
   const f = advance(now);
-  if (f.stop) { stop(); return; }
+  if (f.stop) { stop(!!f.natural); return; }
   $('stage').style.background = f.color;
   $('hud').textContent = f.hud;
+  if (state.toneGate && state.toneCtx)
+    state.toneGate.gain.setTargetAtTime(state.toneW, state.toneCtx.currentTime, 0.004);
   state.raf = requestAnimationFrame(tick);
 }
 
-function stop() {
+function stop(natural = false) {
   if (!state.running) return;
   state.running = false;
   cancelAnimationFrame(state.raf);
   clearTimeout(state.hudTimer);
   $('player').pause();
+  stopTone();
   if (state.wake) { state.wake.release().catch(() => {}); state.wake = null; }
-  $('stage').style.display = 'none';
   $('hud').classList.add('hidden');
+  if (natural && $('callback').value === 'chime') {
+    // the return: a bell, the ground color held, a few quiet seconds before the panel
+    chime();
+    $('stage').style.background = $('colorB').value;
+    $('returnMsg').classList.remove('hidden');
+    state.returnTimer = setTimeout(dismissReturn, 5000);
+  } else {
+    dismissReturn();
+  }
+}
+
+function dismissReturn() {
+  clearTimeout(state.returnTimer);
+  $('returnMsg').classList.add('hidden');
+  $('stage').style.display = 'none';
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
 }
 
@@ -726,8 +1046,13 @@ document.addEventListener('fullscreenchange', () => {
 });
 
 /* kill switch: any key, or any click on the stage */
-window.addEventListener('keydown', e => { if (state.running) { e.preventDefault(); stop(); } });
-$('stage').addEventListener('pointerdown', stop);
+window.addEventListener('keydown', e => {
+  if (state.running) { e.preventDefault(); stop(); }
+  else if (!$('returnMsg').classList.contains('hidden')) dismissReturn();
+});
+$('stage').addEventListener('pointerdown', () => {
+  if (state.running) stop(); else dismissReturn();
+});
 
 function medianOf(a) {
   const s = a.slice().sort((x, y) => x - y);
