@@ -147,6 +147,8 @@
   .btn2.on { border-color: var(--ember); color: var(--ember); }
   .meter { flex: 1; min-width: 120px; height: 8px; background: var(--ink0); border: 1px solid var(--line); }
   .meter > div { height: 100%; background: var(--ember); width: 0%; }
+  #liveScope { width: 100%; height: 70px; display: block; margin-top: 14px; background: var(--ink0); border: 1px solid var(--line); }
+  #scopeCaption { font-size: 11px; color: var(--dim); margin-top: 4px; }
 
   /* ---------- return overlay ---------- */
   #returnMsg {
@@ -241,10 +243,13 @@
     </div>
     <div class="row">
       <label class="small" for="sens">Sensitivity</label>
-      <input type="range" id="sens" min="1.5" max="6" step="0.5" value="3">
+      <input type="range" id="sens" min="2" max="20" step="0.5" value="8">
+      <span class="small" id="sensOut" style="color:var(--dim);min-width:2em">8</span>
       <label class="small" for="liveMult" style="margin-left:10px">Flicker = drum ×</label>
       <input type="number" id="liveMult" value="2" min="0.5" max="6" step="0.5">
     </div>
+    <canvas id="liveScope"></canvas>
+    <div id="scopeCaption">Last six seconds — the orange line is the attack strength the mic hears, grey is the trigger level, green ticks are detected hits. Steady drumming should give evenly spaced ticks: if hits are missed, lower Sensitivity; if ticks appear between strokes, raise it.</div>
     <p class="hint" id="liveVerdict" style="margin:6px 0 0"></p>
     <div class="row">
       <label class="small" for="liveMins">Session length</label>
@@ -359,7 +364,8 @@ const state = {
   toneCtx: null, toneGate: null, toneVolNode: null,
   live: {                  // microphone beat tracker
     ctx: null, analyser: null, buf: null, stream: null, monitoring: false,
-    baseline: 0, lastOnset: 0, lastBeat: 0, ivs: [], period: 0, ready: false,
+    prevE: 0, fluxHist: [], scope: [], hits: 0,
+    lastOnset: 0, lastBeat: 0, ivs: [], period: 0, ready: false,
   },
 };
 
@@ -449,7 +455,8 @@ async function openMic(deviceId) {
     L.analyser.fftSize = 2048;
     L.buf = new Float32Array(L.analyser.fftSize);
     // a new device has its own noise floor and tempo history
-    L.baseline = 0; L.ivs = []; L.period = 0; L.lastBeat = 0; L.lastOnset = 0;
+    L.prevE = 0; L.fluxHist = []; L.scope = []; L.hits = 0;
+    L.ivs = []; L.period = 0; L.lastBeat = 0; L.lastOnset = 0;
     L.ready = true;
     $('micBtn').textContent = 'Microphone live';
     $('micStatus').textContent = 'Hit the drum a few times so I can find your rate.';
@@ -484,6 +491,8 @@ async function listMics(stream) {
   } catch (e) {}
 }
 
+const SCOPE_FRAMES = 360;   // ~6 s of history at 60 fps
+
 function micMonitor() {
   const L = state.live;
   if (!L.ctx) { L.monitoring = false; return; }
@@ -491,33 +500,107 @@ function micMonitor() {
   let s = 0;
   for (let i = 0; i < L.buf.length; i++) s += L.buf[i] * L.buf[i];
   const e = Math.sqrt(s / L.buf.length);
-  L.baseline = 0.995 * (L.baseline || e) + 0.005 * e;   // slow floor estimate
+
+  // Onsets come from the RISE in energy, like the offline analyzer — not from the
+  // absolute level. A level test against a slow average drifts upward under
+  // continuous drumming until hits stop clearing it, which feels like the detector
+  // randomly missing beats while you play perfectly steadily.
+  const flux = Math.max(0, e - L.prevE);
+  L.prevE = e;
+
+  L.fluxHist.push(flux);
+  if (L.fluxHist.length > 120) L.fluxHist.shift();     // ~2 s of context
+  let sum = 0;
+  for (const f of L.fluxHist) sum += f;
+  // between strokes the flux sits near zero, so this mean stays low however loud
+  // the drum is — the threshold tracks the room, not the playing
+  const thr = Math.max(2e-5, (sum / L.fluxHist.length) * +$('sens').value);
+
   const tNow = performance.now() / 1000;
-  if (e > Math.max(0.004, L.baseline * +$('sens').value) && tNow - L.lastOnset > 0.15) {
+  const refr = L.period ? Math.max(0.1, 0.55 * L.period) : 0.12;   // scales with tempo
+  let onset = false;
+  if (flux > thr && tNow - L.lastOnset > refr) {
+    onset = true;
     const d = tNow - L.lastOnset;
     L.lastOnset = L.lastBeat = tNow;
-    if (d > 0.15 && d < 1.5) {
+    L.hits++;
+    // an interval far off the running tempo is a miss or a double-trigger, not the
+    // drummer changing speed — let it flash, but keep it out of the tempo estimate
+    const ok = L.period ? (d > 0.5 * L.period && d < 1.8 * L.period) : (d > 0.12 && d < 1.5);
+    if (ok) {
       L.ivs.push(d);
       if (L.ivs.length > 8) L.ivs.shift();
       L.period = medianOf(L.ivs);
     }
   }
+  // playing stopped: drop the old tempo so the next burst locks on cleanly
+  if (L.period && tNow - L.lastOnset > 3) { L.ivs = []; L.period = 0; }
+
+  L.scope.push({ f: flux, t: thr, o: onset });
+  if (L.scope.length > SCOPE_FRAMES) L.scope.shift();
+
   $('micLevel').style.width = Math.min(100, e * 600) + '%';
+  if (!state.running) drawScope();   // the panel is behind the stage mid-session
   updateLiveReadout();
   requestAnimationFrame(micMonitor);
 }
 
+function drawScope() {
+  const cv = $('liveScope');
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (!w) return;                    // hidden tab: nothing to draw into
+  const dpr = window.devicePixelRatio || 1;
+  if (cv.width !== w * dpr || cv.height !== h * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+  const g = cv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const S = state.live.scope;
+  if (S.length < 2) return;
+  let peak = 1e-6;
+  for (const p of S) { if (p.f > peak) peak = p.f; if (p.t > peak) peak = p.t; }
+  const x = i => i / SCOPE_FRAMES * w;
+  const y = v => h - 3 - (v / peak) * (h - 8);
+
+  g.lineWidth = 1;
+  g.strokeStyle = 'rgba(143,191,111,.85)';            // detected hits
+  S.forEach((p, i) => {
+    if (!p.o) return;
+    g.beginPath(); g.moveTo(x(i), 2); g.lineTo(x(i), h - 2); g.stroke();
+  });
+  g.strokeStyle = 'rgba(140,131,152,.55)';            // trigger level
+  g.beginPath();
+  S.forEach((p, i) => i ? g.lineTo(x(i), y(p.t)) : g.moveTo(x(i), y(p.t)));
+  g.stroke();
+  g.strokeStyle = 'rgba(228,87,46,.95)';              // attack strength
+  g.beginPath();
+  S.forEach((p, i) => i ? g.lineTo(x(i), y(p.f)) : g.moveTo(x(i), y(p.f)));
+  g.stroke();
+}
+
 function updateLiveReadout() {
   const L = state.live;
-  if (!L.period) { $('liveHzOut').textContent = 'listening…'; return; }
+  if (!L.period) {
+    $('liveHzOut').textContent = L.hits ? `${L.hits} hits — no steady tempo yet` : 'listening…';
+    $('liveVerdict').textContent = '';
+    return;
+  }
   const m = Math.max(1, Math.round(+$('liveMult').value || 2));
   const f = m / L.period;
-  $('liveHzOut').textContent = `drum ${(1 / L.period).toFixed(2)} Hz`;
+  // spread of the accepted intervals: wide spread while you drum steadily means the
+  // detector is mis-firing, not that your playing is uneven
+  let sd = 0;
+  if (L.ivs.length > 2) {
+    let q = 0;
+    for (const d of L.ivs) q += (d - L.period) ** 2;
+    sd = Math.sqrt(q / L.ivs.length);
+  }
+  $('liveHzOut').textContent = `drum ${(1 / L.period).toFixed(2)} Hz ±${Math.round(sd * 1000)} ms · ${L.hits} hits`;
   const v = rateVerdict(f, f, f);
   $('liveVerdict').textContent = `→ flicker ${f.toFixed(2)} Hz` + (v.msg ? ' · ' + v.msg : '');
   $('liveVerdict').style.color = v.color;
 }
 $('liveMult').addEventListener('input', updateLiveReadout);
+$('sens').addEventListener('input', () => { $('sensOut').textContent = $('sens').value; });
 
 /* ---------- analysis ---------- */
 $('audioFile').addEventListener('change', loadAudio);
