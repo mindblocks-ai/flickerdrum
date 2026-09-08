@@ -350,7 +350,6 @@ const state = {
   lastMediaT: -1,          // media-clock interpolation (some browsers update coarsely)
   lastMediaWall: 0,
   toneW: 0,                // current tone gate weight (may run at the drum's rate, not the light's)
-  dphase: 0,               // drum-rate phase, 0 = a hit (rate-follow accumulates it)
   toneCtx: null, toneGate: null, toneVolNode: null,
   live: {                  // microphone beat tracker
     ctx: null, analyser: null, buf: null, stream: null, monitoring: false,
@@ -827,10 +826,11 @@ function drawRaster() {
 $('begin').addEventListener('click', () => begin());
 
 async function begin() {
+  if (state.running) return;   // no re-entry: a double-click during the awaits would
+                               // orphan a tone context and a second rAF loop
   const stage = $('stage'), hud = $('hud');
   state.running = true;
   state.phase = 0;
-  state.dphase = 0;
   state.toneW = 0;
   state.curveIdx = 0;
   state.beatIdx = 0;
@@ -955,7 +955,10 @@ function advance(now) {
       drumHz = currentDrumHz(t);
       flickerHz = drumHz * m;
       state.phase = (state.phase + flickerHz * dt) % 1;
-      dphase = state.dphase = (state.dphase + drumHz * dt) % 1;
+      // the tone's drum phase anchors to the actual tracked hits — a free-running
+      // integrator here starts offset from the strikes and drifts without bound
+      // (alt-tab pauses rAF while the audio plays on)
+      dphase = beatPhase(t, 1).phase1;
       hudText = `drum ${drumHz.toFixed(2)} Hz · flicker ${flickerHz.toFixed(2)} Hz · rate-follow · ${fmtTime(t)} / ${fmtTime(state.buffer.duration)}`;
     }
   } else if (state.mode === 'live') {
@@ -991,13 +994,21 @@ function advance(now) {
   // it reinforces the drumming; following the light instead would put a tone blip in
   // the gap between hits at any multiplier above 1. With no drum it follows the light.
   const tp = ($('toneSync').value === 'beat' && dphase !== undefined) ? dphase : state.phase;
-  state.toneW = shapePulse(tp) * fadeF;
+  state.toneW = tonePulse(tp) * fadeF;
   return { color: mixColor(pulse * (+$('bright').value / 100)), hud: hudText };
 }
 
 // luminance shaping: hard = square wave, soft = cosine fade between ground and flash
 function shapePulse(p) {
   return $('edge').value === 'hard' ? (p < 0.5 ? 1 : 0) : 0.5 * (1 + Math.cos(2 * Math.PI * p));
+}
+// the tone is a short accent ON the strike, not a copy of the light: a fixed-duty
+// pulse peaking at phase 0 with a cosine decay, independent of the light's edge.
+// (Gating the carrier with the light's 50%-duty square at drum rate reads as a
+// slow on/off warble, not a hit.)
+function tonePulse(p) {
+  const duty = 0.18;
+  return p < duty ? Math.cos(Math.PI * p / (2 * duty)) ** 2 : 0;
 }
 function hex3(hex) {
   const v = parseInt(hex.slice(1), 16);
@@ -1008,11 +1019,15 @@ function mixColor(w) {
   return `rgb(${Math.round(B[0] + (A[0] - B[0]) * w)},${Math.round(B[1] + (A[1] - B[1]) * w)},${Math.round(B[2] + (A[2] - B[2]) * w)})`;
 }
 
-/* ---------- isochronic tone: a carrier gated by the same pulse as the light ---------- */
+/* ---------- isochronic tone: a carrier gated by tonePulse — riding the drum
+   hits by default, or the light flashes (see the Pulses select) ---------- */
 function startTone() {
   if ($('tone').value !== 'on') return;
   try {
     const c = new (window.AudioContext || window.webkitAudioContext)();
+    // in drum mode this runs after awaits, outside the click's activation window —
+    // WebKit hands such contexts over suspended, and a suspended context is silent
+    if (c.state === 'suspended') c.resume().catch(() => {});
     const osc = c.createOscillator();
     osc.frequency.value = +$('toneHz').value || 210;
     const gate = c.createGain(); gate.gain.value = 0;
