@@ -120,6 +120,14 @@
   }
   #begin:disabled { background: var(--ink2); color: var(--dim); cursor: not-allowed; }
   #begin:not(:disabled):hover { filter: brightness(1.1); }
+  #beginVR {
+    display: block; width: 100%; margin-top: 10px;
+    background: var(--ink2); border: 1px solid var(--line); color: var(--bone);
+    font-weight: 600; font-size: 14px; letter-spacing: .1em; text-transform: uppercase;
+    padding: 12px; cursor: pointer;
+  }
+  #beginVR:disabled { color: var(--dim); cursor: not-allowed; }
+  #beginVR:not(:disabled):hover { border-color: var(--ember); }
   .footnote { color: var(--dim); font-size: 12px; text-align: center; margin-top: 14px; }
   .hidden { display: none !important; }
 
@@ -210,7 +218,7 @@
     </div>
     <div class="row">
       <label class="small" for="mult">Flicker = drum ×</label>
-      <input type="number" id="mult" value="3" min="0.5" max="6" step="0.5">
+      <input type="number" id="mult" value="2" min="0.5" max="6" step="0.5">
       <span id="multPreview" class="small" style="color:var(--dim)"></span>
     </div>
     <div class="row">
@@ -246,8 +254,8 @@
     </div>
     <div class="row">
       <label class="small" for="sens">Sensitivity</label>
-      <input type="range" id="sens" min="2" max="20" step="0.5" value="8">
-      <span class="small" id="sensOut" style="color:var(--dim);min-width:2em">8</span>
+      <input type="range" id="sens" min="1" max="5" step="0.25" value="2">
+      <span class="small" id="sensOut" style="color:var(--dim);min-width:2em">2</span>
       <label class="small" for="liveMult" style="margin-left:10px">Flicker = drum ×</label>
       <input type="number" id="liveMult" value="2" min="0.5" max="6" step="0.5">
     </div>
@@ -335,7 +343,9 @@
   </fieldset>
 
   <button id="begin" disabled>Begin</button>
+  <button id="beginVR" class="hidden" disabled>Begin in VR</button>
   <p class="footnote">Runs fullscreen. Click anywhere or press any key to stop instantly.</p>
+  <p class="footnote hidden" id="vrNote">VR fills your whole visual field — far stronger than a screen. Pull any controller trigger to stop.</p>
 </main>
 
 <div id="stage"></div>
@@ -366,10 +376,11 @@ const state = {
   toneW: 0,                // current tone gate weight (may run at the drum's rate, not the light's)
   toneCtx: null, toneGate: null, toneVolNode: null,
   toneBeforeLive: null,    // tone setting parked while the live tab forces it off
+  xrSession: null, gl: null,
   live: {                  // microphone beat tracker
     ctx: null, analyser: null, buf: null, stream: null, monitoring: false,
     prevE: 0, fluxHist: [], scope: [], hits: 0,
-    lastOnset: 0, lastBeat: 0, ivs: [], period: 0, ready: false,
+    lastOnset: 0, lastBeat: 0, ivs: [], period: 0, lastPeriod: 0, ready: false,
   },
 };
 
@@ -398,9 +409,22 @@ $('tabLive').addEventListener('click', () => setMode('live'));
 $('tabFixed').addEventListener('click', () => setMode('fixed'));
 
 function updateBegin() {
-  $('begin').disabled =
+  const off =
     state.mode === 'drum' ? !state.curve :
     state.mode === 'live' ? !state.live.ready : false;
+  $('begin').disabled = off;
+  $('beginVR').disabled = off;
+}
+
+const VR_NOTE = $('vrNote').textContent;   // restored after an error, so the safety line survives
+
+// the VR button only exists when a headset is actually reachable
+if (navigator.xr && navigator.xr.isSessionSupported) {
+  navigator.xr.isSessionSupported('immersive-vr').then(ok => {
+    if (!ok) return;
+    $('beginVR').classList.remove('hidden');
+    $('vrNote').classList.remove('hidden');
+  }).catch(() => {});
 }
 
 /* ---------- fixed controls ---------- */
@@ -482,7 +506,7 @@ async function openMic(deviceId) {
     L.buf = new Float32Array(L.analyser.fftSize);
     // a new device has its own noise floor and tempo history
     L.prevE = 0; L.fluxHist = []; L.scope = []; L.hits = 0;
-    L.ivs = []; L.period = 0; L.lastBeat = 0; L.lastOnset = 0;
+    L.ivs = []; L.period = 0; L.lastPeriod = 0; L.lastBeat = 0; L.lastOnset = 0;
     L.ready = true;
     $('micBtn').textContent = 'Microphone live';
     $('micStatus').textContent = 'Hit the drum a few times so I can find your rate.';
@@ -522,6 +546,17 @@ const SCOPE_FRAMES = 360;   // ~6 s of history at 60 fps
 function micMonitor() {
   const L = state.live;
   if (!L.ctx) { L.monitoring = false; return; }
+  // inside an immersive session the XR frame loop drives the analysis instead:
+  // window rAF is throttled or stops entirely while a headset is presenting
+  // (a device that vanishes mid-read must not take the loop down with it — there
+  // is no path back to a running loop once this chain breaks)
+  try { if (!state.xrSession) micStep(); } catch (e) {}
+  requestAnimationFrame(micMonitor);
+}
+
+function micStep() {
+  const L = state.live;
+  if (!L.ctx) return;
   L.analyser.getFloatTimeDomainData(L.buf);
   let s = 0;
   for (let i = 0; i < L.buf.length; i++) s += L.buf[i] * L.buf[i];
@@ -534,15 +569,22 @@ function micMonitor() {
   const flux = Math.max(0, e - L.prevE);
   L.prevE = e;
 
-  L.fluxHist.push(flux);
-  if (L.fluxHist.length > 120) L.fluxHist.shift();     // ~2 s of context
-  let sum = 0;
-  for (const f of L.fluxHist) sum += f;
-  // between strokes the flux sits near zero, so this mean stays low however loud
-  // the drum is — the threshold tracks the room, not the playing
-  const thr = Math.max(2e-5, (sum / L.fluxHist.length) * +$('sens').value);
-
   const tNow = performance.now() / 1000;
+  L.fluxHist.push({ t: tNow, f: flux });
+  // trimmed by TIME, not frame count: 120 frames is 2 s at 60 fps but only 1 s at
+  // 120 fps, so a fixed count silently changes what the threshold sees per display
+  while (L.fluxHist.length && tNow - L.fluxHist[0].t > 2) L.fluxHist.shift();
+  let sum = 0, sq = 0;
+  for (const h of L.fluxHist) { sum += h.f; sq += h.f * h.f; }
+  const n = L.fluxHist.length || 1, mu = sum / n;
+  const sd = Math.sqrt(Math.max(0, sq / n - mu * mu));
+  // mean + k·deviation, NOT mean × k. A plain multiple of the mean climbs with the
+  // drumming's duty cycle, so faster tempi raise the bar until strokes stop clearing
+  // it — the same "misses beats while you play steadily" fault, just moved up to
+  // around 5 Hz. Measured against the deviation, the margin stays flat across both
+  // tempo and frame rate.
+  const thr = Math.max(2e-5, mu + (+$('sens').value) * sd);
+
   const refr = L.period ? Math.max(0.1, 0.55 * L.period) : 0.12;   // scales with tempo
   let onset = false;
   if (flux > thr && tNow - L.lastOnset > refr) {
@@ -559,8 +601,10 @@ function micMonitor() {
       L.period = medianOf(L.ivs);
     }
   }
-  // playing stopped: drop the old tempo so the next burst locks on cleanly
-  if (L.period && tNow - L.lastOnset > 3) { L.ivs = []; L.period = 0; }
+  // playing stopped: drop the old tempo so the next burst locks on cleanly, but
+  // keep the rate itself — the flicker holds it through the pause rather than
+  // snapping to a bare-start default nothing in the room is playing
+  if (L.period && tNow - L.lastOnset > 3) { L.lastPeriod = L.period; L.ivs = []; L.period = 0; }
 
   L.scope.push({ f: flux, t: thr, o: onset });
   if (L.scope.length > SCOPE_FRAMES) L.scope.shift();
@@ -568,7 +612,6 @@ function micMonitor() {
   $('micLevel').style.width = Math.min(100, e * 600) + '%';
   if (!state.running) drawScope();   // the panel is behind the stage mid-session
   updateLiveReadout();
-  requestAnimationFrame(micMonitor);
 }
 
 function drawScope() {
@@ -1053,13 +1096,32 @@ function drawRaster() {
 }
 
 /* ---------- run ---------- */
-$('begin').addEventListener('click', () => begin());
+$('begin').addEventListener('click', () => begin(false));
+$('beginVR').addEventListener('click', () => begin(true));
 
-async function begin() {
+async function begin(vr) {
   if (state.running) return;   // no re-entry: a double-click during the awaits would
                                // orphan a tone context and a second rAF loop
   const stage = $('stage'), hud = $('hud');
   state.running = true;
+  state.scrollY = window.scrollY;
+
+  // VR is entered FIRST. requestSession does not resolve until the headset prompt
+  // is accepted and the headset is actually on — often a minute. Starting the
+  // clocks before that would spend the fade-in on a black screen and greet the
+  // wearer with full-intensity flicker, in the one mode that fills their vision.
+  if (vr) {
+    $('vrNote').textContent = VR_NOTE;
+    try {
+      await startVR();
+    } catch (e) {
+      stop();
+      $('vrNote').textContent = 'Could not start VR: ' + (e.message || e);
+      return;
+    }
+    if (!state.running) return;   // stopped while the headset was being put on
+  }
+
   state.phase = 0;
   state.toneW = 0;
   state.curveIdx = 0;
@@ -1092,6 +1154,12 @@ async function begin() {
     state.startWall = performance.now();
   }
   startTone();
+
+  if (vr) {
+    // the headset is the whole display — no fullscreen, no wake lock, no HUD
+    state.xrSession.requestAnimationFrame(xrTick);
+    return;
+  }
 
   stage.style.display = 'block';
   document.documentElement.classList.add('session');
@@ -1167,7 +1235,7 @@ function advance(now) {
       // silence before the drum: hold the ground color, keep phase at 0 so the
       // first flash lands on the drum's entry
       state.phase = 0; state.toneW = 0;
-      return { color: $('colorB').value, hud: `waiting for the drum · ${fmtTime(t)} / ${fmtTime(state.buffer.duration)}` };
+      return { w: 0, color: mixColor(0), hud: `waiting for the drum · ${fmtTime(t)} / ${fmtTime(state.buffer.duration)}` };
     }
     arcE = t - state.curve.activeStart;
     const m = +$('mult').value || 2;
@@ -1198,12 +1266,12 @@ function advance(now) {
     const L = state.live;
     if (!L.lastBeat) {
       state.phase = 0; state.toneW = 0;
-      return { color: $('colorB').value, hud: 'waiting for the first hit — play your drum' };
+      return { w: 0, color: mixColor(0), hud: 'waiting for the first hit — play your drum' };
     }
     arcE = t;
     // whole cycles per hit, same reason as beat-locked mode
     const m = Math.max(1, Math.round(+$('liveMult').value || 2));
-    const P = L.period || 0.3;
+    const P = L.period || L.lastPeriod || 0.3;
     // phase re-anchors to the latest live hit; between hits it runs at the median period
     state.phase = ((now / 1000 - L.lastBeat) / P * m) % 1;
     dphase = ((now / 1000 - L.lastBeat) / P) % 1;
@@ -1226,7 +1294,8 @@ function advance(now) {
   // the gap between hits at any multiplier above 1. With no drum it follows the light.
   const tp = ($('toneSync').value === 'beat' && dphase !== undefined) ? dphase : state.phase;
   state.toneW = tonePulse(tp) * fadeF;
-  return { color: mixColor(pulse * (+$('bright').value / 100)), hud: hudText };
+  const w = pulse * (+$('bright').value / 100);
+  return { w, color: mixColor(w), hud: hudText };
 }
 
 // luminance shaping: hard = square wave, soft = cosine fade between ground and flash
@@ -1245,9 +1314,18 @@ function hex3(hex) {
   const v = parseInt(hex.slice(1), 16);
   return [v >> 16 & 255, v >> 8 & 255, v & 255];
 }
-function mixColor(w) {
+// 0..1 components, shared by the CSS stage and the WebGL clear color in VR
+function mixRGB(w) {
   const A = hex3($('colorA').value), B = hex3($('colorB').value);
-  return `rgb(${Math.round(B[0] + (A[0] - B[0]) * w)},${Math.round(B[1] + (A[1] - B[1]) * w)},${Math.round(B[2] + (A[2] - B[2]) * w)})`;
+  return [
+    (B[0] + (A[0] - B[0]) * w) / 255,
+    (B[1] + (A[1] - B[1]) * w) / 255,
+    (B[2] + (A[2] - B[2]) * w) / 255,
+  ];
+}
+function mixColor(w) {
+  const c = mixRGB(w);
+  return `rgb(${Math.round(c[0] * 255)},${Math.round(c[1] * 255)},${Math.round(c[2] * 255)})`;
 }
 
 /* ---------- isochronic tone: a carrier gated by tonePulse — riding the drum
@@ -1300,9 +1378,71 @@ function tick(now) {
   if (f.stop) { stop(!!f.natural); return; }
   $('stage').style.background = f.color;
   $('hud').textContent = f.hud;
+  pushTone();
+  state.raf = requestAnimationFrame(tick);
+}
+
+function pushTone() {
   if (state.toneGate && state.toneCtx)
     state.toneGate.gain.setTargetAtTime(state.toneW, state.toneCtx.currentTime, 0.004);
-  state.raf = requestAnimationFrame(tick);
+}
+
+/* ---------- VR: the entire scene is one framebuffer clear per frame ----------
+   No geometry and no camera — the headset's whole field of view IS the flicker,
+   which is the closest thing to a true ganzfeld this can offer. */
+let vrCanvas = null, vrGL = null;
+
+// one context for the life of the page: browsers cap live WebGL contexts and
+// force-lose the oldest, so a fresh one per session would churn them away
+function vrContext() {
+  if (!vrGL) {
+    vrCanvas = document.createElement('canvas');
+    vrGL = vrCanvas.getContext('webgl', { xrCompatible: true });
+    // a lost context turns gl.clear into a silent no-op while the compositor keeps
+    // displaying the last frame submitted — which can be a full-brightness flash,
+    // frozen in front of someone's eyes. End the session instead.
+    if (vrGL) vrCanvas.addEventListener('webglcontextlost', e => { e.preventDefault(); stop(); });
+  }
+  return vrGL;
+}
+
+async function startVR() {
+  const gl = vrContext();
+  if (!gl) throw new Error('WebGL unavailable');
+  const session = await navigator.xr.requestSession('immersive-vr');
+  // claim the session before anything that can throw: otherwise a failure below
+  // leaves the headset in a live session stop() does not know about and cannot
+  // end, which also blocks every later attempt to start one
+  state.xrSession = session;
+  state.gl = gl;
+  session.addEventListener('select', () => stop());    // any trigger stops it
+  session.addEventListener('squeeze', () => stop());
+  session.addEventListener('end', () => {
+    state.xrSession = null;
+    if (state.running) stop();
+  });
+  try {
+    if (gl.makeXRCompatible) await gl.makeXRCompatible();
+    session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+  } catch (e) {
+    session.end().catch(() => {});
+    throw e;
+  }
+}
+
+function xrTick(now, frame) {
+  const session = state.xrSession;
+  if (!state.running || !session) return;
+  if (state.mode === 'live') micStep();   // window rAF does not run us in here
+  const f = advance(now);
+  if (f.stop) { stop(!!f.natural); return; }
+  const gl = state.gl;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, session.renderState.baseLayer.framebuffer);
+  const c = mixRGB(f.w);
+  gl.clearColor(c[0], c[1], c[2], 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  pushTone();
+  session.requestAnimationFrame(xrTick);
 }
 
 function stop(natural = false) {
@@ -1312,6 +1452,11 @@ function stop(natural = false) {
   clearTimeout(state.hudTimer);
   $('player').pause();
   stopTone();
+  if (state.xrSession) {
+    const s = state.xrSession;
+    state.xrSession = null;            // cleared first: the end handler re-enters
+    s.end().catch(() => {});
+  }
   if (state.wake) { state.wake.release().catch(() => {}); state.wake = null; }
   $('hud').classList.add('hidden');
   if (natural && $('callback').value === 'chime') {
@@ -1330,6 +1475,9 @@ function dismissReturn() {
   $('returnMsg').classList.add('hidden');
   $('stage').style.display = 'none';
   document.documentElement.classList.remove('session');
+  // overflow:hidden clamped the page to the top; put the reader back where the
+  // Begin button was, which on a short viewport is well down the panel
+  if (state.scrollY) window.scrollTo(0, state.scrollY);
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
 }
 
