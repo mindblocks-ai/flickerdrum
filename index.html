@@ -74,6 +74,9 @@
   .row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
   .row + .row { margin-top: 14px; }
   label.small { font-size: 12px; color: var(--dim); }
+  .hint { font-size: 12px; color: var(--dim); margin: 10px 0 0; }
+  .hint a { color: var(--ember); text-decoration: none; border-bottom: 1px solid rgba(228,87,46,.4); }
+  .hint a:hover { border-bottom-color: var(--ember); }
 
   .tabs { display: flex; gap: 0; margin-bottom: 18px; border: 1px solid var(--line); }
   .tabs button {
@@ -162,6 +165,10 @@
     <div class="row">
       <input type="file" id="audioFile" accept="audio/*">
     </div>
+    <p class="hint">Use a local audio file (mp3, wav, ogg). If your track lives on YouTube, convert it to an audio file first — or use a freely distributed drumming track from
+      <a href="https://shamanicdrumming.com/free_downloads.html" target="_blank" rel="noopener">shamanicdrumming.com</a>,
+      <a href="https://archive.org/search?query=shamanic+drumming" target="_blank" rel="noopener">archive.org</a>, or
+      <a href="https://pixabay.com/music/search/shamanic%20drum/" target="_blank" rel="noopener">pixabay</a>.</p>
     <div class="row">
       <label class="small" for="drumBand">Drum speed band</label>
       <select id="drumBand">
