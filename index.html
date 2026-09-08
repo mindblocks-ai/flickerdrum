@@ -109,7 +109,8 @@
   #analysisStatus.ok { color: var(--ember); }
   #curveWrap { margin-top: 14px; display: none; }
   #curve { width: 100%; height: 90px; display: block; background: var(--ink0); border: 1px solid var(--line); }
-  #curveCaption { font-size: 11px; color: var(--dim); margin-top: 4px; }
+  #raster { width: 100%; height: 44px; display: block; background: var(--ink0); border: 1px solid var(--line); margin-top: 10px; }
+  #curveCaption, #rasterCaption { font-size: 11px; color: var(--dim); margin-top: 4px; }
 
   #begin {
     display: block; width: 100%; margin-top: 6px;
@@ -193,6 +194,8 @@
     <div id="curveWrap">
       <canvas id="curve"></canvas>
       <div id="curveCaption"></div>
+      <canvas id="raster"></canvas>
+      <div id="rasterCaption">Ten seconds of detected hits from the middle of the track — each mark is one flash anchor.</div>
     </div>
   </fieldset>
 
@@ -203,6 +206,7 @@
       <input type="range" id="fixedHz" min="1" max="20" step="0.1" value="7.5">
       <span class="readout"><span id="fixedHzVal">7.5</span> Hz</span>
     </div>
+    <p class="hint" id="fixedNote" style="margin:6px 0 0"></p>
     <div class="row">
       <label class="small" for="fixedMins">Session length</label>
       <input type="number" id="fixedMins" value="10" min="0" max="120" step="1">
@@ -218,6 +222,16 @@
       <label class="small" for="colorB" style="margin-left:10px">Ground</label>
       <input type="color" id="colorB" value="#000000">
     </div>
+    <div class="row">
+      <label class="small" for="edge">Edge</label>
+      <select id="edge">
+        <option value="hard" selected>Hard · full contrast</option>
+        <option value="soft">Soft · cosine fade</option>
+      </select>
+      <label class="small" for="bright" style="margin-left:10px">Brightness</label>
+      <input type="range" id="bright" min="10" max="100" value="100" style="max-width:120px">
+      <span class="small" id="brightOut" style="color:var(--dim)">100%</span>
+    </div>
   </fieldset>
 
   <button id="begin" disabled>Begin</button>
@@ -226,6 +240,7 @@
 
 <div id="stage"></div>
 <div id="hud" class="hidden"></div>
+<audio id="player"></audio>
 
 <script>
 'use strict';
@@ -233,11 +248,10 @@ const $ = id => document.getElementById(id);
 
 const state = {
   mode: 'drum',            // 'drum' | 'fixed'
-  buffer: null,            // decoded AudioBuffer
-  curve: null,             // { times: [], hz: [], conf: [] }
-  ctx: null,               // AudioContext
-  source: null,
-  startCtxTime: 0,
+  buffer: null,            // low-rate AudioBuffer, analysis only (playback streams via <audio>)
+  curve: null,             // { times, hz, conf, activeStart, beats }
+  audioURL: null,          // object URL feeding the <audio> element
+  wake: null,              // screen wake lock
   running: false,
   phase: 0,
   lastFrame: 0,
@@ -270,7 +284,16 @@ function updateBegin() {
 }
 
 /* ---------- fixed controls ---------- */
-$('fixedHz').addEventListener('input', () => { $('fixedHzVal').textContent = (+$('fixedHz').value).toFixed(1); });
+function updateFixedNote() {
+  const hz = +$('fixedHz').value;
+  $('fixedHzVal').textContent = hz.toFixed(1);
+  const v = rateVerdict(hz, hz, hz);
+  $('fixedNote').textContent = v.msg;
+  $('fixedNote').style.color = v.color;
+}
+$('fixedHz').addEventListener('input', updateFixedNote);
+updateFixedNote();
+$('bright').addEventListener('input', () => { $('brightOut').textContent = $('bright').value + '%'; });
 
 /* ---------- analysis ---------- */
 $('audioFile').addEventListener('change', loadAudio);
@@ -282,10 +305,15 @@ async function loadAudio() {
   if (!file) return;
   status('Decoding audio…');
   try {
+    if (state.audioURL) URL.revokeObjectURL(state.audioURL);
+    state.audioURL = URL.createObjectURL(file);
+    $('player').src = state.audioURL;   // playback streams the file; no giant buffer held
+
+    // decode a low-rate copy for analysis only — onsets don't need 44.1 kHz,
+    // and a 30-minute track decoded full-rate is ~600 MB of floats
     const bytes = await file.arrayBuffer();
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    state.buffer = await ctx.decodeAudioData(bytes);
-    ctx.close();
+    const octx = new OfflineAudioContext(1, 1, 11025);
+    state.buffer = await octx.decodeAudioData(bytes);
     await analyze();
   } catch (e) {
     status('Could not decode that file — try mp3/wav/ogg.');
@@ -314,8 +342,49 @@ async function analyze() {
     for (let i = 0; i < n; i++) mono[i] += d[i];
   }
 
-  // onset-strength envelope: RMS per hop, half-wave rectified flux
-  const hop = 512, frame = 1024;
+  // where the sound actually enters — measured on the UNFILTERED signal against a
+  // robust reference (95th percentile, not peak), so neither the high-pass nor a
+  // loud finale can push the entry point around
+  let activeStart = 0;
+  {
+    const cFps = 20, cHop = Math.round(sr / cFps);
+    const cN = Math.floor(n / cHop);
+    const cEnv = new Float32Array(cN);
+    for (let f = 0; f < cN; f++) {
+      let m = 0; const s = f * cHop, e = s + cHop;
+      for (let j = s; j < e; j++) { const v = Math.abs(mono[j]); if (v > m) m = v; }
+      cEnv[f] = m;
+    }
+    const ref = Float32Array.from(cEnv).sort()[Math.floor(cN * 0.95)];
+    const thr = 0.1 * ref;
+    const need = Math.round(0.25 * cFps);
+    let run = 0;
+    for (let f = 0; f < cN; f++) {
+      if (cEnv[f] > thr) { run++; if (run >= need) { activeStart = (f - run + 1) / cFps; break; } }
+      else run = 0;
+    }
+  }
+
+  // high-pass ~300 Hz (zero-phase biquad, forward then backward): a drum hit's
+  // attack is broadband, but a didgeridoo drone or bass layer sits below 300 Hz
+  // and would otherwise wobble the onset envelope
+  {
+    const f0 = 300, w0 = 2 * Math.PI * f0 / sr, cw = Math.cos(w0), al = Math.sin(w0) / (2 * 0.7071);
+    const a0 = 1 + al, b0 = (1 + cw) / 2 / a0, b1 = -(1 + cw) / a0, b2 = (1 + cw) / 2 / a0,
+          a1 = (-2 * cw) / a0, a2 = (1 - al) / a0;
+    const run = src => {
+      let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+      for (let i = 0; i < src.length; i++) {
+        const x0 = src[i];
+        const y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        src[i] = y0; x2 = x1; x1 = x0; y2 = y1; y1 = y0;
+      }
+    };
+    run(mono); mono.reverse(); run(mono); mono.reverse();
+  }
+
+  // onset-strength envelope: RMS per hop, half-wave rectified flux (~86 fps at any sr)
+  const hop = Math.max(1, Math.round(sr / 86)), frame = hop * 2;
   const envRate = sr / hop;
   const nFrames = Math.max(0, Math.floor((n - frame) / hop));
   const env = new Float32Array(nFrames);
@@ -326,17 +395,6 @@ async function analyze() {
   }
   const onset = new Float32Array(nFrames);
   for (let f = 1; f < nFrames; f++) onset[f] = Math.max(0, env[f] - env[f - 1]);
-
-  // where the sound actually enters: first 0.25 s of sustained energy above 10% of peak
-  let maxEnv = 0;
-  for (let f = 0; f < nFrames; f++) if (env[f] > maxEnv) maxEnv = env[f];
-  const thr = 0.1 * maxEnv;
-  const need = Math.round(0.25 * envRate);
-  let run = 0, activeStart = 0;
-  for (let f = 0; f < nFrames; f++) {
-    if (env[f] > thr) { run++; if (run >= need) { activeStart = (f - run + 1) / envRate; break; } }
-    else run = 0;
-  }
 
   // sliding-window autocorrelation over the chosen one-octave band
   const [hzLo, hzHi] = $('drumBand').value.split(',').map(Number);
@@ -382,9 +440,19 @@ async function analyze() {
     if (confs[i] < 1.15) hzs[i] = lastGood; else lastGood = hzs[i];
   }
   const med = hzs.slice();
-  for (let i = 1; i < hzs.length - 1; i++) {
-    const a = [hzs[i - 1], hzs[i], hzs[i + 1]].sort((x, y) => x - y);
-    med[i] = a[1];
+  for (let i = 2; i < hzs.length - 2; i++) {
+    const a = [hzs[i - 2], hzs[i - 1], hzs[i], hzs[i + 1], hzs[i + 2]].sort((x, y) => x - y);
+    med[i] = a[2];
+  }
+  // despike: a point straying >10% from its ±2s local median is a mis-lock, not the
+  // drummer — snap it back. A real sustained tempo change survives (the local median
+  // itself moves with it after a couple of windows).
+  const base = med.slice();
+  for (let i = 0; i < med.length; i++) {
+    const a = Math.max(0, i - 4), b = Math.min(base.length, i + 5);
+    const loc = base.slice(a, b).sort((x, y) => x - y);
+    const lm = loc[Math.floor(loc.length / 2)];
+    if (Math.abs(med[i] - lm) > 0.1 * lm) med[i] = lm;
   }
   for (let i = 1; i < med.length; i++) med[i] = med[i - 1] + 0.3 * (med[i] - med[i - 1]);
 
@@ -433,20 +501,32 @@ async function analyze() {
     }
   }
 
-  state.curve = { times, hz: med, conf: confs, activeStart, beats };
+  state.curve = { times, hz: med, conf: confs, activeStart, beats, median: medianOf(med) };
   const lo = Math.min(...med), hi = Math.max(...med);
   const enters = activeStart > 0.5 ? ` Drum enters at ${fmtTime(activeStart)}; the flicker waits for it.` : '';
-  status(`Drum read: ${lo.toFixed(2)}–${hi.toFixed(2)} Hz over ${fmtTime(buf.duration)}.${enters}`, true);
+  status(`Drum read: ${lo.toFixed(2)}–${hi.toFixed(2)} Hz, median ${state.curve.median.toFixed(2)}, over ${fmtTime(buf.duration)}.${enters}`, true);
   drawCurve();
   updateMultPreview();
   updateBegin();
 }
 
+// photosensitivity is rated in flashes per second — our flicker Hz directly.
+// 15–25 flashes/s is the most seizure-provocative band; ~6–13 Hz (theta–alpha)
+// is where the ganzflicker imagery literature points.
+function rateVerdict(lo, hi, med) {
+  if (hi >= 15 && lo <= 25) return { color: '#FFB020', msg: '⚠ enters 15–25 Hz — the highest seizure-risk band' };
+  if (med >= 6 && med <= 13) return { color: '#8FBF6F', msg: '✓ in the 6–13 Hz theta–alpha sweet spot for flicker imagery' };
+  return { color: 'var(--dim)', msg: '' };
+}
+
 function updateMultPreview() {
-  if (!state.curve) { $('multPreview').textContent = ''; return; }
+  const el = $('multPreview');
+  if (!state.curve) { el.textContent = ''; return; }
   const m = +$('mult').value || 2;
   const lo = Math.min(...state.curve.hz) * m, hi = Math.max(...state.curve.hz) * m;
-  $('multPreview').textContent = `→ flicker ${lo.toFixed(2)}–${hi.toFixed(2)} Hz`;
+  const v = rateVerdict(lo, hi, state.curve.median * m);
+  el.textContent = `→ flicker ${lo.toFixed(2)}–${hi.toFixed(2)} Hz, median ${(state.curve.median * m).toFixed(2)}` + (v.msg ? ' · ' + v.msg : '');
+  el.style.color = v.color;
 }
 
 function drawCurve() {
@@ -463,9 +543,12 @@ function drawCurve() {
   const pad = Math.max(0.1, (hi - lo) * 0.25);
   const y = v => h - 8 - (v - (lo - pad)) / ((hi + pad) - (lo - pad)) * (h - 16);
   const x = t => 4 + t / times[times.length - 1] * (w - 8);
-  // faint grid line at the midpoint
-  g.strokeStyle = 'rgba(140,131,152,.25)'; g.lineWidth = 1;
-  g.beginPath(); g.moveTo(0, y((lo + hi) / 2)); g.lineTo(w, y((lo + hi) / 2)); g.stroke();
+  // faint reference line at the median rate
+  const my = y(state.curve.median);
+  g.strokeStyle = 'rgba(140,131,152,.35)'; g.lineWidth = 1;
+  g.beginPath(); g.moveTo(0, my); g.lineTo(w, my); g.stroke();
+  g.fillStyle = 'rgba(140,131,152,.8)'; g.font = '10px "IBM Plex Mono", monospace';
+  g.fillText(state.curve.median.toFixed(2), 6, my - 4);
   // tempo line, dimmed where confidence was low
   g.lineWidth = 1.5;
   for (let i = 1; i < times.length; i++) {
@@ -473,11 +556,30 @@ function drawCurve() {
     g.beginPath(); g.moveTo(x(times[i - 1]), y(hz[i - 1])); g.lineTo(x(times[i]), y(hz[i])); g.stroke();
   }
   $('curveCaption').textContent =
-    `Detected drum rate across the track (${lo.toFixed(2)}–${hi.toFixed(2)} Hz) · ${state.curve.beats.length} hits tracked. Dim segments = low confidence, value held.`;
+    `Detected drum rate across the track (${lo.toFixed(2)}–${hi.toFixed(2)} Hz, median ${state.curve.median.toFixed(2)} — the gray line) · ${state.curve.beats.length} hits tracked. Dim segments = low confidence, value held.`;
+  drawRaster();
+}
+
+function drawRaster() {
+  const beats = state.curve.beats;
+  const cv = $('raster');
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext('2d');
+  g.scale(dpr, dpr);
+  g.clearRect(0, 0, w, h);
+  const t0 = Math.max(0, state.buffer.duration / 2 - 5), span = 10;
+  g.strokeStyle = 'rgba(228,87,46,.95)'; g.lineWidth = 1.5;
+  for (const b of beats) {
+    if (b < t0 || b >= t0 + span) continue;
+    const x = (b - t0) / span * (w - 4) + 2;
+    g.beginPath(); g.moveTo(x, 8); g.lineTo(x, h - 8); g.stroke();
+  }
 }
 
 /* ---------- run ---------- */
-$('begin').addEventListener('click', begin);
+$('begin').addEventListener('click', () => begin());
 
 async function begin() {
   const stage = $('stage'), hud = $('hud');
@@ -488,14 +590,10 @@ async function begin() {
   state.lastFrame = performance.now();
 
   if (state.mode === 'drum') {
-    state.ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const src = state.ctx.createBufferSource();
-    src.buffer = state.buffer;
-    src.connect(state.ctx.destination);
-    src.onended = () => { if (state.running) stop(); };
-    state.source = src;
-    state.startCtxTime = state.ctx.currentTime;
-    src.start();
+    const player = $('player');
+    player.currentTime = 0;
+    player.onended = () => { if (state.running) stop(); };
+    try { await player.play(); } catch (e) {}
     state.endAt = Infinity;
   } else {
     const mins = +$('fixedMins').value || 0;
@@ -508,6 +606,7 @@ async function begin() {
   if (document.documentElement.requestFullscreen) {
     try { await document.documentElement.requestFullscreen(); } catch (e) {}
   }
+  try { state.wake = await navigator.wakeLock.request('screen'); } catch (e) {}
   clearTimeout(state.hudTimer);
   state.hudTimer = setTimeout(() => hud.classList.add('faded'), 4000);
   state.raf = requestAnimationFrame(tick);
@@ -548,22 +647,20 @@ function beatPhase(t, m) {
   return { phase: ((t - b) / P * m) % 1, hz: m / P };
 }
 
-function tick(now) {
-  if (!state.running) return;
+// one frame of flicker logic, shared by the 2D stage and the VR loop:
+// advances the phase and returns { color, hud } (or { stop: true } at session end)
+function advance(now) {
   const dt = Math.min(0.1, (now - state.lastFrame) / 1000);
   state.lastFrame = now;
 
   let flickerHz, hudText;
   if (state.mode === 'drum') {
-    const t = state.ctx.currentTime - state.startCtxTime;
+    const t = $('player').currentTime;
     if (t < state.curve.activeStart) {
       // silence before the drum: hold the ground color, keep phase at 0 so the
       // first flash lands on the drum's entry
       state.phase = 0;
-      $('stage').style.background = $('colorB').value;
-      $('hud').textContent = `waiting for the drum · ${fmtTime(t)} / ${fmtTime(state.buffer.duration)}`;
-      state.raf = requestAnimationFrame(tick);
-      return;
+      return { color: $('colorB').value, hud: `waiting for the drum · ${fmtTime(t)} / ${fmtTime(state.buffer.duration)}` };
     }
     const m = +$('mult').value || 2;
     let drumHz;
@@ -581,13 +678,33 @@ function tick(now) {
     }
   } else {
     const t = (now - state.startWall) / 1000;
-    if (t >= state.endAt) { stop(); return; }
+    if (t >= state.endAt) return { stop: true };
     flickerHz = +$('fixedHz').value;
     state.phase = (state.phase + flickerHz * dt) % 1;
     hudText = `flicker ${flickerHz.toFixed(1)} Hz · ${fmtTime(t)}${state.endAt < Infinity ? ' / ' + fmtTime(state.endAt) : ''}`;
   }
-  $('stage').style.background = state.phase < 0.5 ? $('colorA').value : $('colorB').value;
-  $('hud').textContent = hudText;
+  return { color: mixColor(state.phase), hud: hudText };
+}
+
+// luminance shaping: hard = square wave, soft = cosine fade between ground and
+// flash; brightness caps how far toward the flash color the blend reaches
+function hex3(hex) {
+  const v = parseInt(hex.slice(1), 16);
+  return [v >> 16 & 255, v >> 8 & 255, v & 255];
+}
+function mixColor(p) {
+  let w = $('edge').value === 'hard' ? (p < 0.5 ? 1 : 0) : 0.5 * (1 + Math.cos(2 * Math.PI * p));
+  w *= (+$('bright').value) / 100;
+  const A = hex3($('colorA').value), B = hex3($('colorB').value);
+  return `rgb(${Math.round(B[0] + (A[0] - B[0]) * w)},${Math.round(B[1] + (A[1] - B[1]) * w)},${Math.round(B[2] + (A[2] - B[2]) * w)})`;
+}
+
+function tick(now) {
+  if (!state.running) return;
+  const f = advance(now);
+  if (f.stop) { stop(); return; }
+  $('stage').style.background = f.color;
+  $('hud').textContent = f.hud;
   state.raf = requestAnimationFrame(tick);
 }
 
@@ -596,16 +713,26 @@ function stop() {
   state.running = false;
   cancelAnimationFrame(state.raf);
   clearTimeout(state.hudTimer);
-  if (state.source) { try { state.source.stop(); } catch (e) {} state.source = null; }
-  if (state.ctx) { state.ctx.close(); state.ctx = null; }
+  $('player').pause();
+  if (state.wake) { state.wake.release().catch(() => {}); state.wake = null; }
   $('stage').style.display = 'none';
   $('hud').classList.add('hidden');
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
 }
 
+// leaving fullscreen by any route (system gesture, browser UI) also stops the session
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement && state.running) stop();
+});
+
 /* kill switch: any key, or any click on the stage */
 window.addEventListener('keydown', e => { if (state.running) { e.preventDefault(); stop(); } });
 $('stage').addEventListener('pointerdown', stop);
+
+function medianOf(a) {
+  const s = a.slice().sort((x, y) => x - y);
+  return s[Math.floor(s.length / 2)];
+}
 
 function fmtTime(s) {
   s = Math.max(0, Math.floor(s));
