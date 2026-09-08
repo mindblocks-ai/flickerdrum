@@ -612,13 +612,25 @@ async function loadPreset(track, btn) {
   const gen = ++state.analysisGen;
   [...$('presetBtns').children].forEach(b => b.classList.toggle('on', b === btn));
   $('audioFile').value = '';   // the picker no longer describes what is loaded
+  let bytes;
   try {
-    const bytes = await fetchWithProgress(track.file, track.name, gen);
-    if (gen !== state.analysisGen) return;
+    bytes = await fetchWithProgress(track.file, track.name, gen);
+  } catch (e) {
+    if (e.message !== 'superseded') failLoad(gen, `Could not fetch ${track.name} — ${e.message}.`);
+    return;
+  }
+  if (gen !== state.analysisGen) return;
+  // an upload that failed (a file over the host's size limit, say) can still answer
+  // 200 with an empty body, which would otherwise surface as "unable to decode"
+  if (bytes.byteLength < 100000) {
+    failLoad(gen, `${track.name} is only ${bytes.byteLength} bytes on the server — the audio never uploaded.`);
+    return;
+  }
+  try {
     // copy into a blob for playback before decodeAudioData detaches the buffer
     await ingest(bytes, new Blob([bytes]), gen);
   } catch (e) {
-    failLoad(gen, `Could not load ${track.name} — ${e.message}. Is the file in the repo?`);
+    failLoad(gen, `Downloaded ${track.name} (${(bytes.byteLength / 1048576).toFixed(1)} MB) but could not decode it — is it really an mp3?`);
   }
 }
 
